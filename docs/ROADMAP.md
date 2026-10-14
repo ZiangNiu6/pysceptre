@@ -170,6 +170,7 @@ Ranked by measured win over effort.
 | ~~T2.5 Sparse-matmul null statistic~~ | **42.7 -> 11.2 ms** on the hot call, **1.72x end to end** | measured |
 | T2.3 Parallelize `fit_all_targets` | **measured, and mostly blocked** -- see below | measured |
 | ~~T2.4 Sparse-aware `fit_all_genes`~~ | **already resolved**; the premise was stale | done |
+| T2.6 Many covariates in a trans CRT run | **not measured**; the per-chunk rebuild goes from n*p^2 to n*p | estimate |
 
 **T2.1/T2.2/T2.5 are done.** The per-pair statistic no longer gathers
 `D[:, flat_idxs]` at all: the draws are a `(B, n_cells)` 0/1 CSR matrix and
@@ -268,6 +269,94 @@ scale against sceptre's 33,066:
 | pysceptre, per gene per chunk | 3,660 | ~0.1 min |
 
 Output is bit-for-bit identical, row order included.
+
+### T2.6 Many covariates in a trans CRT run -- OPEN
+
+A high-MOI screen with dozens of one-hot sublibrary columns (p of 20 to 50,
+built by hand), analysed in trans with the complement group and the CRT, is
+too slow. Nothing so far was sized for this: day0 has p = 11, the IRLS and
+precomputation comments assume a handful of covariates, and no benchmark
+script varies p. **Every figure below for p above 11 is arithmetic or an
+estimate, not a measurement.** Step 0 is to measure.
+
+Where p enters (n cells, p covariate columns, G genes, T targets, C targets
+per chunk, I IRLS iterations):
+
+| Step | How often | Cost | Where |
+|---|---|---|---|
+| gene NB fit | once per gene | I x n*p^2, reading a dense `(n, p^2)` array each iteration | `glm/irls.py` |
+| `x_outer_flat` | once per run | 8*n*p^2 bytes: 7.3 GB at 567,690 cells and p = 40 | `glm/irls.py` |
+| target logistic fit | once per chunk | I x C*n*p^2 | `fit_all_targets` |
+| CRT draws | once per target | independent of p | `crt/sampler.py` |
+| gene pieces rebuild | once per gene per chunk: G x ceil(T/C) | n*p^2, twice (`Zt_wZ` and `D`) | `_gene_job`, `compute_precomputation_pieces` |
+| pair statistic | per pair, per stage | B x n_trt x (p + 2) | `compute_null_statistics_from_draws` |
+
+The rebuild is the step trans makes expensive, because every gene meets every
+chunk. Part of it is wasted: `Zt_wZ` and its eigendecomposition depend only on
+the gene's fit, not on the chunk, and `_gene_fit_job` already builds them once
+to read two eigenvalues. The pair statistic is linear in p and is the floor
+that remains.
+
+**0. Measure first.** Profile a run at the screen's own p, and on synthetic
+fixed-seed data with K in {0, 20, 40} extra one-hot columns, splitting time
+into gene fits, target fits plus draws, rebuilds and the pair statistic. Real
+data comes from a path in the environment, as everywhere else. Name the BLAS:
+`one_blas_thread()` is a no-op on macOS.
+
+**Workarounds that need no code change.**
+
+- *Wider chunks.* Raise `chunk_memory_gb` so C grows and the rebuild count
+  G x ceil(T/C) falls; C is also capped by `target_chunk_size` (default 200).
+  Setting `PYSCEPTRE_PREFETCH_DEPTH=1` (default 3) offsets the memory, at the
+  cost of less overlap between preparing a chunk and testing it (T1.4). The
+  budget charges neither p nor `x_outer_flat`.
+- *Shard by target, same `seed`.* `target_seed_sequence` keys each target's
+  draws on its name, and nothing inside the call corrects for multiplicity
+  (`multiple_testing_alpha` only sizes `no_approximation`), so shards
+  concatenate and BH runs afterwards. Shard by target, not by gene, or every
+  shard repeats the target fits and draws. Agreement with a single run is to
+  the ~1e-15 spread of the batched logistic solve.
+- *Permutations, only if calibrated.* They skip the logistic fit and build each
+  gene's pieces once (4.4x faster than the CRT on day0 at `n_jobs=1`, from the
+  README table), but they ignore that high-MOI detection depends on depth and
+  sublibrary. Run `run_calibration_check` with them first.
+- *Fewer columns.* Merging sublibraries that do not differ is a statistical
+  choice, checked with the calibration check.
+
+**A. Keep a p x p factor per gene, so the rebuild costs n*p.** With
+`M = Lambda^(-1/2) V^T` from the eigendecomposition of `Z^T W Z`, and `s` the
+sum of `w_i z_i` over the treated cells, `D 1_trt = M s`. So stack
+`[a | w | wZ]` instead of `[a | w | D^T]`, and take
+`lower_right = ||sums[:, 2:] @ M^T||^2` after the sparse matmul. The pair cost
+gains B x p^2, which is negligible; the rebuild loses both n*p^2 products and
+the `(p, n)` `D`.
+
+It touches `GenePrecomputation` and `_gene_fit_job` (store `M`), `_gene_job`,
+`stack_pieces`, `statistics_from_segment_sums`,
+`compute_observed_full_statistic`, the dose path, `PermutationPrefixSums` and
+`run_low_level_test_full`. `compute_D_matrix` and
+`compute_precomputation_pieces` stay: `test_precompute.py` checks them against
+R.
+
+It is not bit-identical. Test it against the `D` route to ~1e-12 relative at
+p in {3, 40}, and diff day0 p-values before and after.
+
+**B. No `x_outer_flat` for width-1 fits.** For gene fits (and the NT-cells
+per-pair fits), form `X.T @ (w[:, None] * X)`: the same flops, reading n*p per
+iteration instead of n*p^2. Keep the batched form for target chunks, or block
+it over cells. Make `irls_bytes_per_column` charge p, as the NT-cells budget
+already does.
+
+**C. Use the one-hot structure** -- the dummy block of `Z^T W Z` by
+`bincount`, and their share of `s` by a group sum -- only if step 0, rerun
+after A and B, shows the pair statistic dominating. It needs its own design
+note.
+
+**D. `one_blas_thread()`.** Its premise, thin matmuls, weakens at p near 40.
+Re-measure on OpenBLAS before touching it.
+
+What is learned goes to `docs/design.md`, in a "Many covariates" section with
+one-line pointers from the source. Measurements go there, not in docstrings.
 
 ### Note on the performance figures
 
