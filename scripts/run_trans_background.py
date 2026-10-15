@@ -58,7 +58,11 @@ from pysceptre.pipeline.gene_cache import (  # noqa: E402
     load_gene_cache,
     save_gene_cache,
 )
-from pysceptre.pipeline.trans import SCREEN_CODES, iter_trans_analysis, trans_fit_chunks  # noqa: E402
+from pysceptre.pipeline.trans import (  # noqa: E402
+    SCREEN_CODES,
+    iter_trans_analysis,
+    trans_fit_chunks,
+)
 from pysceptre.specificity import run_specificity_check  # noqa: E402
 
 _SIDES = {-1: "left", 0: "both", 1: "right"}
