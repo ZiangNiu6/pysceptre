@@ -97,6 +97,147 @@ returns `[]` and a matmul takes the same time inside and outside the context
 manager. Local benchmarks on a Mac therefore do not exercise this path while
 CI does, so any measurement of it has to name the BLAS it was taken on.
 
+## Indicator columns in the IRLS
+
+Every gene fit and every CRT target fit is an IRLS, and each iteration solves
+the weighted normal equations `X^T W X beta = X^T W z`. `glm_solver` chooses
+how they are formed. `"outer"`, the default, is 0.5.0's route; `"structured"`
+is not from sceptre and changes no estimand.
+
+### Why the outer-product route is bandwidth-bound
+
+`"outer"` builds `x_outer_flat(X)`, the `(n_cells, p^2)` array of per-row
+outer products, once per run, and every iteration forms `X^T W X` as one
+matrix-vector product with it: `n * p^2` multiply-adds, and a read of the
+whole array. With a handful of covariates the array is small and the route is
+the right one. A covariate matrix with a batch factor is not a handful. The
+1.55M-cell screen measured here has `p = 69` (an intercept and five continuous covariates, 60
+batch dummies and 3 replicate dummies) over 1,554,804 cells, so the array is
+`1,554,804 * 69^2 * 8` bytes, about 59 GB, read once per iteration of every
+gene fit and every target chunk fit. Each byte read feeds one multiply-add, so
+the fit runs at memory bandwidth, and no BLAS setting helps ("BLAS threading
+in the IRLS loop").
+
+### What the structured route computes
+
+Most of those columns are 0/1 dummies of a factor, and in any row at most one
+column of a factor is 1. `glm.design.structured_design` finds this from `X`
+alone. A column whose entries are all exactly 0 or 1, and that is neither all
+0 nor all 1, is an indicator; indicators are grouped greedily, left to right,
+each joining the first group with which it never shares a row that is 1.
+Every other column, the intercept among them, is dense. A group is stored as
+one integer code per cell: which of its columns that cell has its 1 in, or
+the group's size for the reference level.
+
+The grouping depends on column order, and a column of a partially crossed
+factor can join another factor's group. Neither changes a sum: any grouping
+of mutually exclusive columns gives the same normal equations, and only the
+number of tables below differs. A binary covariate that is not a dummy
+becomes a group of one, which is still exact.
+
+With `d` dense columns and indicator groups `g, h, ...`, every block of
+`X^T W X` and `X^T W z` is one of:
+
+- dense by dense: `X_d^T (w X_d)`, a BLAS product, `O(n d^2)`;
+- a group with itself: the sum of `w` over the cells of each level, a
+  diagonal block, since a 0/1 column times itself is itself and two columns
+  of one group never meet;
+- dense by group: the sum of `w x_k` over each level's cells, for each dense
+  column `k`;
+- group by group: the table, over pairs of levels, of the sum of `w` over
+  the cells in both;
+- the right-hand side: `X_d^T (w z)`, and the sum of `w z` over each level's
+  cells.
+
+That is `O(n * (d^2 + G*d + G^2))` for `G` groups, against `O(n * p^2)`, and
+no `(n, p^2)` array. `X beta` is the dense product plus one lookup per group.
+On that design `d = 6` and `G = 2`.
+
+The IRLS around it (`_fit_structured`) is `_fit_batch`'s for one response,
+step for step: the same start (`y + 0.1` for the Poisson; the marginal rate
+for the logistic), weights, working response, deviance, convergence rule,
+`maxit` and floor on the mean.
+
+### The same GLM, not the same bits
+
+In exact arithmetic the two routes compute the same sums, so the same
+iterates and the same MLE. In floating point they add the same terms in
+another order, so `X^T W X` differs in its last bits, and so does everything
+downstream: coefficients, fitted values, `theta`, `z_orig`. Usually that is
+all, since a statistic a few ulps away gives the same resampling counts, and
+so the same p-value and stage. It is not guaranteed, and two places amplify a
+last-bit difference.
+
+**`theta` on a gene close to Poisson.** `estimate_theta` falls back from the
+MLE to the method of moments to the pilot estimate, and for a gene with
+little or no overdispersion which branch it ends on can turn on the last bits
+of the fitted means ("A dispersion estimate can stop on a rounding
+accident"). The branches can give values far apart, so such a gene's `theta`,
+and with it its p-values, can differ by much more than rounding. That is the
+estimator's sensitivity, not the route's: a different CPU or BLAS moves the
+same genes ("Bits depend on the machine"). A comparison of the two routes on
+a screen should therefore report every gene whose `theta` method changed.
+
+**A weakly identified target.** When a level of a factor has few or no
+treated cells, the logistic fit's coefficient for it drifts towards minus
+infinity and the normal equations are ill conditioned. There the two routes'
+fitted probabilities agree only about as well as the outer route agrees with
+itself across chunk-mates ("Targets are fit in the reference run's chunks").
+
+### The compiled and numpy sums agree bit for bit
+
+The per-level sums have two implementations: a numba kernel,
+`_indicator_sums_compiled`, which makes one pass over the cells and releases
+the GIL, and `np.bincount` in `_indicator_sums_numpy`, the route without
+numba. Both add each sum's terms one cell at a time in index order, with
+additions only and no `fastmath`, so they return the same bits, and
+`test_compiled_and_bincount_sums_agree_bit_for_bit` checks it. Whether numba
+is installed therefore never changes a structured result.
+
+### Target fits no longer depend on their chunk-mates
+
+The outer route fits a chunk of targets as one batched IRLS, and a batched
+BLAS product does not give a column the same last bits at every batch width,
+so a target's fitted probabilities, and through `rng.binomial(B, p)` its
+draws, depend on which targets share its chunk. The structured route fits
+each target alone: its BLAS products are over that one response, and the
+per-level sums do not see other targets. A target's fit is a function of the
+target and the design, the same at any `target_chunk_size`,
+`chunk_memory_gb` or `n_jobs`, and target fits run on a thread pool without
+changing a value. Gene fits were already one per call.
+
+### Why the default stays "outer"
+
+0.5.0's results came from the outer route, and a reference run, its gene-fit
+cache and any trans run tested against it must use one route throughout.
+Making `"structured"` the default would change the last bits of every
+existing result with no change to the caller's code. So `"outer"` stays the
+default and leaves every result bit-identical to 0.5.0, and `"structured"` is
+chosen once per analysis: `run_trans_analysis` must be given the reference
+run's, and a `GeneFitCache` records it in its fingerprint (a cache written
+before the option existed counts as `"outer"`) and is refused under the
+other.
+
+`"structured"` is offered with the complement control group only. Against
+the NT cells the gene is refit for every pair on that pair's cells, a
+different loop, and nothing there was measured.
+
+### Measured
+
+`scripts/measure_structured_irls.py` on that screen's design (1,554,804 cells,
+`p = 69`, `d = 6`, groups of 60 and 3 levels), on an AMD EPYC 7543 with
+OpenBLAS 0.3.29 (Haswell kernel), numpy 2.2.6 and numba 0.67.0, one BLAS
+thread, CPU time per fit:
+
+| | structured | outer |
+|---|---|---|
+| gene fit, median of 24 random tested genes | 0.82 s | 16.6 s |
+| target fit, the first 6 tested targets | 0.62 s, each alone | 8.26 s per target, as one batch of 6 |
+
+The fitted means agreed to 7.5e-9 relative and the clamped `theta` to 3.0e-9,
+with the same iteration counts and `theta` methods for all 24 genes; the
+targets' fitted probabilities agreed to 9.6e-10.
+
 ## The CRT sampler draws with replacement
 
 R decides how many of the `B` resamples include cell `j` with a binomial draw,
@@ -1123,6 +1264,116 @@ On day2 the elements with the most background calls sit at the TSSs of FOXH1
 - **Same test on both sides.** The cis and background results should come
   from the same test. Mixing R's CRT on one side with pysceptre on the other
   is an untested assumption.
+
+## The trans background
+
+The specificity check measures its background on the screen's elements tested
+against its cis genes on other chromosomes, with the test the cis side used
+("Same test on both sides", above). On a transcriptome-wide screen that is of
+the order of 1e8 pairs. `run_trans_analysis` (`pipeline/trans.py`) runs them
+with the reference (cis) run's test, and is not from sceptre.
+
+### Why the cost is not per pair
+
+Discovery fits each gene once and each target once, batched per target chunk,
+then rebuilds a gene's pieces (`mu`, `w`, `a`, `D` and the stacked
+`(n_cells, p + 2)` array) once per gene per chunk it meets
+(`_run_target_chunks`). The chunk width comes from `chunk_memory_gb`, which
+charges each target `10 * n_cells * 8` bytes of fit arrays: on a screen of
+1.5M cells the default budget gives chunks of six targets. A cis pair list
+meets each gene in a handful of chunks; a trans list meets every gene in
+every chunk, so the rebuilds, each `O(n_cells * p^2)` work and a few GB of
+fresh memory at that size, grow with genes times chunks and dominate.
+Dividing a cis run's time by its pair count and multiplying by the trans
+count therefore prices mostly fixed costs.
+
+The trans run keeps the fits as they are and changes only the loop: a shard's
+targets are all fit and drawn first, then each gene's pieces are built once
+and tested against every target of the shard. Rebuilds become genes times
+shards. Width-1 gene fits depend on nothing but the gene, so they are
+computed once and reused by every shard (`pipeline/gene_cache.py`), with a
+fingerprint of the data and of the numerical environment that refuses a cache
+made elsewhere.
+
+### Targets are fit in the reference run's chunks
+
+A target's draws come from its fitted probabilities through
+`rng.binomial(B, p)`, and the batched logistic fit is not bit for bit across
+batch compositions ("Resampling budgets" and `_resolve_target_chunk_size`).
+So the trans run fits every target with exactly the chunk-mates it had in the
+reference run: `reference_fit_chunks` rebuilds the reference layout from the
+reference run's pairs and settings, `run_trans_analysis` refuses a layout of
+another width or count, and a shard is a set of whole reference chunks, all
+of whose targets are fit whether or not the shard tests them.
+
+Under `glm_solver="structured"` a target's fit does not depend on its
+chunk-mates ("Indicator columns in the IRLS"), so the layout no longer
+decides any bits. It is still rebuilt and checked, which costs nothing and
+keeps one code path. Either way the trans run takes the reference run's
+`glm_solver`, and a gene-fit cache made under the other is refused.
+
+### Two screens, both exact for the check
+
+The check reads a background test only through `called_down` (p-value at most
+the cutoff, `log_2_fold_change` below 0), and the TSS lookup only through
+`lowers` and `lowers_nominal` (the same, and `p < 0.05`). Two kinds of work
+cannot change any of them.
+
+**A fold change of at least 1.** Such a pair is never a call, whatever its
+p-value. It is not resampled; it is reported with `screen` "fold_change",
+`p_value` NaN, and its fold change and statistic, and it is still counted as
+a test.
+
+**The rest of the first stage.** A pair escalates when its first-stage
+p-value is at most 0.02. The counts of null statistics on each side of the
+observed one only grow as resamples are added, so the p-value those counts
+give with the full `B1` denominator is a lower bound on the stage's p-value.
+The stage stops once that bound exceeds 0.02, so the pair cannot escalate,
+and reaches 0.05, so it cannot be a nominal lookup call either. Two-sided,
+that is a count of at least 12 on each side, a bound of 26/500 = 0.052;
+one-sided, a count of at least 24, a bound of 0.05. Such a pair is reported
+with `screen` "early_stop", `p_value` NaN and the bound in `p_value_floor`.
+`run_specificity_check` refuses a bound at or below the cutoff, or below the
+nominal level on a TSS target, so the screens cannot be paired with a cutoff
+they do not serve.
+
+A pair that escalates runs all 499 first-stage resamples, and its p-value
+comes from the second stage's draws through `run_low_level_test_full`'s own
+calls, so it is the full test's result. The first stage is computed in blocks
+of rows, and a block's statistics equal the corresponding rows of the full
+product bit for bit: scipy's sparse product computes each row on its own, and
+so does the statistic. The block route skips the full product's shortcut for
+an all-empty draw matrix, whose NaN differs from 0/0's only in its payload.
+`test_early_stop_rule.py` and `test_trans_engine.py` pin all of this.
+
+Under `side="right"` the screens are still exact for the check's calls, which
+need a negative effect; a pair a right-sided test would call with a positive
+effect is screened.
+
+### Bits depend on the machine
+
+numpy dispatches `exp` and `log` to AVX-512 loops where the CPU has them, and
+scipy's OpenBLAS picks its kernels by CPU model, so the same code gives
+different last bits on different node types. On the 1.55M-cell screen the same
+0.5.0 code on an Intel Sapphire Rapids node, with a different target set,
+against the AMD EPYC 7502 run: `z_orig` differed on all 280 shared pairs
+(median 1.9e-11 relative, at most 3.1e-9), `fold_change` on all 280 (at most
+1.7e-11), the p-value on 10 stage-2 pairs (at most 3.8e-10) and the stage on
+none. A trans run that must match its reference bit for bit therefore runs on
+the reference run's CPU class. `scripts/run_trans_background.py` tests every
+reference pair of a shard in full first and stops the shard on any
+difference, so a wrong node type fails in minutes rather than silently.
+
+### What it does not establish
+
+- **Exact relative to pysceptre, not to R.** The screens and the layout make
+  the trans run equal to a full pysceptre run; how pysceptre compares with R
+  is the rest of this page.
+- **A screened p-value is not a p-value.** A screened row's NaN `p_value`
+  means "tested, not resampled", unlike discovery's NaN. A trans result is
+  for the specificity check; anything that needs the p-values themselves,
+  such as their distribution, should use the audit sample the runner keeps
+  unscreened.
 
 ## gRNA integration strategies
 

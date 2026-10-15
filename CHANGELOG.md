@@ -2,6 +2,41 @@
 
 Notable changes per release. Dates are the release date.
 
+## Unreleased
+
+### Added
+
+- **`glm_solver`** on `run_discovery_analysis`, `run_calibration_check`,
+  `run_power_check` and `run_trans_analysis`. `"outer"`, the default, is
+  0.5.0's IRLS and leaves every result bit-identical. `"structured"` forms the
+  same weighted normal equations from the covariate matrix's 0/1 indicator
+  columns by per-level sums instead of the `(n_cells, p^2)` array of per-row
+  outer products, which on a design with many one-hot covariates (batch
+  dummies) costs far less time and memory. The same GLM, not the same bits. It
+  also fits each CRT target alone, so a target's fit no longer depends on the
+  other targets in its chunk. Complement control group only. Not from
+  sceptre; see docs/design.md, "Indicator columns in the IRLS".
+- **`run_trans_analysis`**, not from sceptre: tests background pairs (the
+  screen's elements against genes on other chromosomes) with a reference
+  discovery run's test, for `run_specificity_check`. Targets are fit in the
+  reference run's chunks, so a pair tested in full gets the reference run's
+  result bit for bit on the same CPU class. Two screens skip resampling that
+  cannot change the check's calls (`screen` "fold_change" and "early_stop",
+  `p_value` NaN). Gene fits can be cached and reused across shards
+  (`pysceptre.pipeline.gene_cache`). Complement control group, CRT,
+  `skew_normal` and the union strategy only. See docs/design.md, "The trans
+  background".
+
+### Changed
+
+- **`run_specificity_check`** derives `log_2_fold_change` from `fold_change`
+  when a result has only the latter, as a discovery result does; counts a
+  screened trans row as a test that is not a call, and refuses one whose
+  screen could hide a call at the cutoff; warns when a cis gene has no
+  background test, whose background rate then counts as 0; reads the trans
+  result once; gives the same rows for categorical and object id columns; and
+  names the first pairs when a cis pair spans two chromosomes.
+
 ## 0.5.0
 
 ### Added

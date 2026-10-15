@@ -28,8 +28,16 @@ __all__ = [
 
 DEFAULT_DISTANCE_BINS: tuple[float, ...] = (0.0, 1e3, 1e4, 5e4, 1e5, np.inf)
 _RESULT_COLUMNS = ("grna_target", "response_id", "p_value", "log_2_fold_change")
+_ID_COLUMNS = ("grna_target", "response_id")
+# A screened trans result's own columns, carried through when present.
+_SCREEN_COLUMNS = ("screen", "p_value_floor")
+# `screen` values of a pair that was tested but not resampled: no p-value.
+_SCREENED = ("fold_change", "early_stop")
 # Draws times pairs held at once by the bootstrap; bounds memory, not the answer.
 _BOOTSTRAP_BLOCK = 1 << 22
+# An element x gene matrix denser than this is multiplied as a dense array, with the
+# same bits; see docs/design.md, "Specificity check".
+_DENSE_ABOVE = 0.5
 
 
 def _require(frame: pd.DataFrame, name: str, columns: Sequence[str]) -> None:
@@ -39,17 +47,127 @@ def _require(frame: pd.DataFrame, name: str, columns: Sequence[str]) -> None:
 
 
 def tested_pairs(result: pd.DataFrame, name: str) -> pd.DataFrame:
-    """The rows of a discovery result that were tested: `pass_qc` true, finite p-value."""
-    _require(result, name, _RESULT_COLUMNS)
+    """The rows of a discovery result that were tested, in their order.
+
+    A row was tested when its p-value is finite, or when a screened trans
+    result marks it `screen` "fold_change" or "early_stop": tested, not
+    resampled, so its p-value is NaN. With a `pass_qc` column, that must be
+    true as well.
+
+    Returns:
+        `grna_target` and `response_id` as object dtype, so categorical
+        input gives the same frame as object input; `p_value`;
+        `log_2_fold_change`, which is `np.log2(fold_change)` when the result
+        has only `fold_change`; then `screen` and `p_value_floor`, each only
+        when the result has it.
+
+    Raises:
+        KeyError: a column is missing, or both `log_2_fold_change` and
+            `fold_change` are.
+    """
+    return _tested(result, name)
+
+
+def _tested(
+    result: pd.DataFrame, name: str, targets: Collection[str] | None = None
+) -> pd.DataFrame:
+    """`tested_pairs`, restricted to the rows of `targets` when given."""
+    absent = [c for c in _RESULT_COLUMNS[:3] if c not in result.columns]
+    derive = "log_2_fold_change" not in result.columns
+    hint = ""
+    if derive and "fold_change" not in result.columns:
+        absent.append("log_2_fold_change")
+        hint = " (fold_change can stand in for log_2_fold_change)"
+    if absent:
+        raise KeyError(f"{name} is missing column(s): {absent}{hint}")
     keep = np.isfinite(result["p_value"].to_numpy(dtype=float))
+    if "screen" in result.columns:
+        keep |= result["screen"].isin(_SCREENED).to_numpy()
     if "pass_qc" in result.columns:
         keep &= result["pass_qc"].astype(bool).to_numpy()
-    return result.loc[keep, list(_RESULT_COLUMNS)].reset_index(drop=True)
+    if targets is not None:
+        keep &= result["grna_target"].isin(targets).to_numpy()
+
+    # Column by column, so nothing but the kept rows is copied.
+    def kept(column: str) -> pd.Series:
+        values = result[column][keep]
+        values.index = pd.RangeIndex(len(values))
+        return values
+
+    out = {c: kept(c) for c in _RESULT_COLUMNS[:3]}
+    for c in _ID_COLUMNS:
+        if out[c].dtype != object:
+            out[c] = out[c].astype(object)
+    if derive:
+        with np.errstate(divide="ignore"):
+            lfc = np.log2(result["fold_change"].to_numpy(dtype=float)[keep])
+        out["log_2_fold_change"] = pd.Series(lfc)
+    else:
+        out["log_2_fold_change"] = kept("log_2_fold_change")
+    for c in _SCREEN_COLUMNS:
+        if c in result.columns:
+            out[c] = kept(c)
+    return pd.DataFrame(out, copy=False)
 
 
 def called_down(result: pd.DataFrame, cutoff: float) -> np.ndarray:
     """Called at `cutoff` with a negative effect: a link on the cis side, a background call on the other."""
     return (result["p_value"].to_numpy() <= cutoff) & (result["log_2_fold_change"].to_numpy() < 0)
+
+
+def _refuse_unsafe_screens(
+    pairs: pd.DataFrame, name: str, cutoff: float, *, nominal: float | None = None
+) -> None:
+    """Raise when a screened row of `pairs` could be a call the caller counts.
+
+    A screened row has no p-value, so it counts as not called. That is exact
+    when its effect is not negative, or when its `p_value_floor` (a lower
+    bound on its p-value) is above `cutoff` and, with `nominal`, at least
+    `nominal`. See docs/design.md, "The trans background".
+    """
+    if "screen" not in pairs.columns or pairs.empty:
+        return
+    down = pairs["log_2_fold_change"].to_numpy(dtype=float) < 0
+    fc = down & (pairs["screen"] == "fold_change").to_numpy()
+    if fc.any():
+        raise ValueError(
+            f"{name} has {int(fc.sum())} row(s) with screen 'fold_change' and a negative "
+            "log_2_fold_change, including (grna_target, response_id) "
+            f"{_first_pairs(pairs, fc)}. That screen skips only pairs with a fold change of "
+            "at least 1, so these rows are inconsistent."
+        )
+    early = down & (pairs["screen"] == "early_stop").to_numpy()
+    if not early.any():
+        return
+    if "p_value_floor" in pairs.columns:
+        floor = pairs["p_value_floor"].to_numpy(dtype=float)
+    else:
+        floor = np.full(len(pairs), np.nan)
+    safe = floor > cutoff
+    need = f"above the cutoff {cutoff!r}"
+    if nominal is not None:
+        safe &= floor >= nominal
+        need += f" and at least the nominal level {nominal!r}"
+    bad = early & ~safe
+    if bad.any():
+        raise ValueError(
+            f"{name} has {int(bad.sum())} row(s) with screen 'early_stop' and a negative "
+            f"log_2_fold_change whose p_value_floor is missing or not {need}, including "
+            f"(grna_target, response_id) {_first_pairs(pairs, bad)}. Their p-values could be "
+            "calls at that level: test those pairs without the early stop, or call below "
+            "their floor."
+        )
+
+
+def _first_pairs(pairs: pd.DataFrame, rows: np.ndarray, n: int = 5) -> list[tuple]:
+    first = np.flatnonzero(rows)[:n]
+    return list(
+        zip(
+            pairs["grna_target"].to_numpy()[first],
+            pairs["response_id"].to_numpy()[first],
+            strict=True,
+        )
+    )
 
 
 def element_table(element_positions: pd.DataFrame) -> pd.DataFrame:
@@ -101,8 +219,9 @@ def cis_links(
 
     Args:
         cis_result: a discovery result (`grna_target`, `response_id`,
-            `p_value`, `log_2_fold_change`, optionally `pass_qc`) on pairs with
-            the element and the gene on the same chromosome.
+            `p_value`, `log_2_fold_change` or `fold_change`, optionally
+            `pass_qc`) on pairs with the element and the gene on the same
+            chromosome.
         element_positions: `grna_target`, `chrom`, `centre`.
         gene_positions: `response_id`, `chrom`, `tss`.
         cutoff: the nominal p-value threshold the screen was called at.
@@ -118,7 +237,24 @@ def cis_links(
         KeyError: a target or gene has no position.
         ValueError: a pair has its element and gene on different chromosomes.
     """
-    pairs = tested_pairs(cis_result, "cis_result")
+    return _cis_links(
+        tested_pairs(cis_result, "cis_result"),
+        element_positions,
+        gene_positions,
+        cutoff,
+        control_targets=control_targets,
+    )
+
+
+def _cis_links(
+    pairs: pd.DataFrame,
+    element_positions: pd.DataFrame,
+    gene_positions: pd.DataFrame,
+    cutoff: float,
+    *,
+    control_targets: Collection[str] = (),
+) -> pd.DataFrame:
+    """`cis_links` from `tested_pairs(cis_result)`."""
     pairs = pairs.loc[~pairs["grna_target"].isin(set(control_targets))].reset_index(drop=True)
     elements = element_table(element_positions)
     missing = sorted(set(pairs["grna_target"]) - set(elements.index))
@@ -132,9 +268,22 @@ def cis_links(
     g_chrom = genes["chrom"].reindex(pairs["response_id"]).to_numpy()
     apart = e_chrom != g_chrom
     if apart.any():
+        first = np.flatnonzero(apart)[:10]
+        listed = list(
+            zip(
+                pairs["grna_target"].to_numpy()[first],
+                pairs["response_id"].to_numpy()[first],
+                e_chrom[first],
+                g_chrom[first],
+                strict=True,
+            )
+        )
         raise ValueError(
-            f"{int(apart.sum())} cis_result pair(s) put the element and the gene on different "
-            "chromosomes, so they have no distance. Pass those as trans_result."
+            f"{int(apart.sum())} cis_result pair(s), of "
+            f"{pairs.loc[apart, 'grna_target'].nunique()} target(s), put the element and the "
+            "gene on different chromosomes, so they have no distance. Pass those as "
+            "trans_result, or drop them. The first (grna_target, response_id, element chrom, "
+            f"gene chrom): {listed}"
         )
     centre = elements["centre"].reindex(pairs["grna_target"]).to_numpy(dtype=float)
     tss = genes["tss"].reindex(pairs["response_id"]).to_numpy(dtype=float)
@@ -154,24 +303,70 @@ def background_pairs(
 
     The cis elements against the cis genes, gene on another chromosome, gene
     chromosome not in `exclude_gene_chroms`, tested. Restricting to the cis
-    sets is what lets the two sides be matched gene for gene.
+    sets is what lets the two sides be matched gene for gene. `trans_result`
+    may be a screened trans result (`run_trans_analysis`): its screened rows
+    are tests that are not calls.
 
     Returns:
-        `grna_target`, `response_id`, `p_value`, `log_2_fold_change` and
+        `grna_target`, `response_id`, `p_value`, `log_2_fold_change`, then
+        `screen` and `p_value_floor` when `trans_result` has them, and
         `background` (called at the cis `cutoff` with a negative effect).
+
+    Raises:
+        ValueError: a screened row with a negative effect could be a call at
+            `cutoff`: screened on its fold change, or stopped early with a
+            `p_value_floor` that is missing or not above `cutoff`.
     """
-    pairs = tested_pairs(trans_result, "trans_result")
-    pairs = pairs.loc[
-        pairs["grna_target"].isin(set(links["grna_target"]))
-        & pairs["response_id"].isin(set(links["response_id"]))
-    ].reset_index(drop=True)
+    return _background(
+        tested_pairs(trans_result, "trans_result"),
+        links,
+        element_positions,
+        gene_positions,
+        cutoff,
+        exclude_gene_chroms=exclude_gene_chroms,
+    )
+
+
+def _background(
+    pairs: pd.DataFrame,
+    links: pd.DataFrame,
+    element_positions: pd.DataFrame,
+    gene_positions: pd.DataFrame,
+    cutoff: float,
+    *,
+    exclude_gene_chroms: Collection[str] = ("chrY",),
+) -> pd.DataFrame:
+    """`background_pairs` from `tested_pairs(trans_result)`.
+
+    Consumes `pairs`: when every row is kept, the result is `pairs` itself
+    with the `background` column added, so a caller must not use it again.
+    """
     elements = element_table(element_positions)
-    genes = gene_table(gene_positions, pairs["response_id"].unique())
-    g_chrom = genes["chrom"].reindex(pairs["response_id"]).to_numpy()
-    e_chrom = elements["chrom"].reindex(pairs["grna_target"]).to_numpy()
-    keep = (g_chrom != e_chrom) & ~np.isin(g_chrom, list(exclude_gene_chroms))
-    pairs = pairs.loc[keep].reset_index(drop=True)
-    return pairs.assign(background=called_down(pairs, cutoff))
+    targets = pd.Index(pd.unique(links["grna_target"]))
+    genes = pd.Index(pd.unique(links["response_id"]))
+    # Positions in the link sets, -1 outside them; one hash lookup per row and column.
+    ti = targets.get_indexer(pairs["grna_target"])
+    gi = genes.get_indexer(pairs["response_id"])
+    keep = (ti >= 0) & (gi >= 0)
+    present = genes[np.bincount(gi[keep], minlength=len(genes)) > 0]
+    positions = gene_table(gene_positions, present)
+    e_chrom = elements["chrom"].reindex(targets).to_numpy()
+    g_chrom = positions["chrom"].reindex(genes).to_numpy()
+    if keep.any():
+        # Chromosomes as shared codes; a missing one never equals anything, as with `!=`.
+        codes = pd.factorize(np.concatenate([e_chrom, g_chrom]))[0]
+        e_code, g_code = codes[: len(targets)], codes[len(targets) :]
+        g_code[g_code < 0] = -2
+        excluded = np.isin(g_chrom, list(exclude_gene_chroms))
+        keep &= (e_code[ti] != g_code[gi]) & ~excluded[gi]
+    if keep.all():
+        out = pairs
+    else:
+        out = pairs.take(np.flatnonzero(keep))
+        out.index = pd.RangeIndex(len(out))
+    _refuse_unsafe_screens(out, "trans_result", cutoff)
+    out["background"] = called_down(out, cutoff)
+    return out
 
 
 def per_gene_background(
@@ -253,13 +448,16 @@ def above_background_by_distance(
 
     # Removing an element from `links` must remove it from the background too; see
     # docs/design.md, "Broad-effect elements".
-    bg = background.loc[
-        background["grna_target"].isin(elems) & background["response_id"].isin(genes)
-    ]
-    te = e_index.get_indexer(bg["grna_target"])
-    tg = g_index.get_indexer(bg["response_id"])
-    tested = sparse.csc_matrix((np.ones(len(bg)), (te, tg)), shape=(n_e, n_g))
-    calls = sparse.csc_matrix((bg["background"].to_numpy(dtype=float), (te, tg)), shape=(n_e, n_g))
+    te = e_index.get_indexer(background["grna_target"])
+    tg = g_index.get_indexer(background["response_id"])
+    inside = (te >= 0) & (tg >= 0)
+    te, tg = te[inside], tg[inside]
+    called = background["background"].to_numpy(dtype=float)[inside]
+    tested = _incidence(te, tg, np.ones(te.size), (n_e, n_g))
+    # Zero terms add nothing to these integer sums, so only the calls are stored.
+    nz = called != 0
+    calls = _incidence(te[nz], tg[nz], called[nz], (n_e, n_g))
+    del te, tg, called, nz
 
     ce = e_index.get_indexer(links["grna_target"])
     cg = g_index.get_indexer(links["response_id"])
@@ -280,7 +478,7 @@ def above_background_by_distance(
     np.add.at(links_eb, (ce, cb), links["link"].to_numpy(dtype=float))
 
     def estimate(w: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        rate = np.nan_to_num((calls.T @ w.T).T / (tested.T @ w.T).T)
+        rate = np.nan_to_num(_weighted_sums(calls, w) / _weighted_sums(tested, w))
         n = w @ pairs_eb
         cis = (w @ links_eb) / n
         bg_sum = np.empty((w.shape[0], n_bins))
@@ -310,6 +508,27 @@ def above_background_by_distance(
             out[name] = p[0]
             out[f"{name}_lo"], out[f"{name}_hi"] = np.nanpercentile(d, [2.5, 97.5], axis=0)
     return out
+
+
+def _incidence(
+    rows: np.ndarray, cols: np.ndarray, values: np.ndarray, shape: tuple[int, int]
+) -> sparse.csc_matrix | np.ndarray:
+    """`values` summed into an elements x genes matrix, dense when more than half is set."""
+    m = sparse.csc_matrix((values, (rows, cols)), shape=shape)
+    if m.nnz > _DENSE_ABOVE * shape[0] * shape[1]:
+        return m.toarray()
+    return m
+
+
+def _weighted_sums(m: sparse.csc_matrix | np.ndarray, w: np.ndarray) -> np.ndarray:
+    """`w @ m`, draws x genes.
+
+    Every product and partial sum is an integer below 2**53 when `m` counts
+    tests or calls, so the dense and the sparse path give the same bits.
+    """
+    if isinstance(m, np.ndarray):
+        return w @ m
+    return (m.T @ w.T).T
 
 
 def nearest_tss(

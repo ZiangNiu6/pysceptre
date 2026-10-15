@@ -139,6 +139,7 @@ run_discovery_analysis(
     target_chunk_size: int = 200,
     chunk_memory_gb: float = 1.0,
     grna_target_weights: dict[str, np.ndarray] | None = None,
+    glm_solver: str = "outer",
 ) -> pd.DataFrame
 ```
 
@@ -160,6 +161,7 @@ run_discovery_analysis(
 | `n_jobs` | `int` | Workers for the per-pair tests, which are ~80% of the runtime. `1` (default) runs serially; a negative value uses every core. **Results do not depend on it** -- only the genes inside an already-drawn target chunk are distributed, so the resampling draws are made in the same order at any worker count, and output is bit-identical. Processes on Linux, threads elsewhere (`fork` after macOS's Accelerate BLAS can deadlock), so the ceiling is lower off Linux; against the NT cells, where every pair is a GLM fit, threads are capped at four because more contend for the GIL. Memory grows by about one gene's working arrays per worker, not by `chunk_memory_gb` per worker. |
 | `chunk_memory_gb` | `float` | Budget for the arrays a *chunk* holds, which sizes how many genes or targets are processed together. **Not** a cap on the process's memory -- the input, retained state and allocator overhead sit outside it. **You should not normally need to change this.** The default is both the fastest and the leanest setting measured: a larger budget produces chunks past the point where batching still pays, costing memory for no throughput (4 GB gave 8.42 GB peak against 3.78 GB at 1 GB, for the same runtime). Default `1.0`. |
 | `grna_target_weights` | `dict[str, np.ndarray] \| None` | Runs the **dose test** instead of sceptre's: each target's cells enter the test with these weights, aligned with `grna_target_cells`, in place of 1. Not from sceptre -- see [`dose_weights`](#pysceptredose_weights), which builds both dicts from gRNA counts. Weights must be finite and positive; all-ones weights give sceptre's result exactly. Complement control group, CRT and the union strategy only. |
+| `glm_solver` | `"outer"` \| `"structured"` | How the gene and target GLMs are fit. `"outer"` (default) is 0.5.0's IRLS and reproduces its results bit for bit. `"structured"` forms the same normal equations from the covariate matrix's 0/1 indicator columns, so a design with many batch dummies costs far less time and needs no `(n_cells, p^2)` array, and it fits each target on its own, so a target's fit does not depend on its chunk. It fits the same GLM, not to the same last bits: a gene whose counts are close to Poisson can get a different dispersion estimate, as it can on another CPU. Complement control group only; anything else raises `ValueError`. Not from sceptre -- see [Design decisions](https://broadinstitute.github.io/pysceptre/design/#indicator-columns-in-the-irls). |
 
 **Returns** a `pd.DataFrame`, one row per input pair, with columns:
 
@@ -211,7 +213,7 @@ column -- see below for why there isn't one.
 | `n_nonzero_trt_thresh`, `n_nonzero_cntrl_thresh` | Pairwise QC thresholds, sceptre's defaults being `7`. Prefer your object's own values. |
 | `pass_qc_rate` | R's `p_hat`, the fraction of discovery pairs clearing QC, which sizes how many synthetic groups get built. Only matters when the group count is above its floor of 100 -- but there it is decisive. |
 | `negative_control_pairs` | Test exactly these pairs instead of constructing any, with `grna_target` entries being `&`-joined NTC gRNA ids. This is how you compare against an R result pair-by-pair. |
-| `moi`, `control_group`, `resampling_mechanism` | As for `run_discovery_analysis`, with the same defaults. With `control_group="nt_cells"` the whole check runs on the NT cells alone, as in R: a synthetic target is tested against the rest of them, so at least two NT gRNAs are needed. |
+| `moi`, `control_group`, `resampling_mechanism`, `glm_solver` | As for `run_discovery_analysis`, with the same defaults. With `control_group="nt_cells"` the whole check runs on the NT cells alone, as in R: a synthetic target is tested against the rest of them, so at least two NT gRNAs are needed. |
 | `ntc_grna_weights` | Checks the **dose test** instead of sceptre's: each NTC gRNA's weights, aligned with `ntc_grna_cells` (`dose_weights(...).ntc_grna_weights`). A synthetic target's cell takes its largest weight over the group's gRNAs. Complement control group and CRT only. |
 
 **QC works differently here, deliberately.** A discovery result reports QC
@@ -251,7 +253,7 @@ power = run_power_check(
 |---|---|
 | `positive_control_pairs` | The pairs to test. **Supply these**: which target perturbs which gene is a claim only the experiment can make. Omitted, sceptre's name-matching rule is used -- a target that is itself a gene id pairs with that gene -- which works when targets are named after genes and finds *nothing* when they are named after genomic intervals. On a real screen of the latter kind it matched 0 of 3,071 targets, so that case raises rather than quietly returning an empty result. |
 | `n_nonzero_trt_thresh`, `n_nonzero_cntrl_thresh` | Pairwise QC thresholds. Against the NT cells the control count is the gene's nonzero NT cells, as in R. |
-| `moi`, `control_group`, `ntc_grna_cells`, `resampling_mechanism`, `grna_target_weights` | As for `run_discovery_analysis`, with the same defaults. |
+| `moi`, `control_group`, `ntc_grna_cells`, `resampling_mechanism`, `grna_target_weights`, `glm_solver` | As for `run_discovery_analysis`, with the same defaults. |
 
 **QC is reported, not filtered** -- the opposite of the calibration check.
 The result has one row per supplied pair, with `pass_qc`, `n_nonzero_trt` and
@@ -439,6 +441,47 @@ The background is matched gene for gene rather than pooled, because
 well-expressed genes are called more often, and its intervals are a bootstrap
 over elements. What the result means and what it has been checked against is in
 [Design decisions](https://broadinstitute.github.io/pysceptre/design/#specificity-check).
+
+### `pysceptre.run_trans_analysis`
+
+Tests the background pairs `run_specificity_check` needs, elements against
+genes on other chromosomes, with the test a reference discovery run used on
+the cis pairs. Not from sceptre.
+
+```python
+from pysceptre import run_trans_analysis
+
+trans_result = run_trans_analysis(
+    response_matrix, gene_ids, covariate_matrix, grna_target_cells,
+    trans_pairs,                # QC-passed background pairs
+    reference_pairs=cis_pairs,  # the pairs the reference run was given
+    seed=0,                     # and the rest of its settings
+)
+```
+
+| Argument | Notes |
+|---|---|
+| `response_matrix`, `gene_ids`, `covariate_matrix`, `grna_target_cells` | The same objects the reference run was given. |
+| `pairs` | The background pairs, QC-passed, with an optional `mode` column: `"screened"` (default), `"full"` or `"audit"`. |
+| `reference_pairs` | The pairs the reference run was given; they fix its target chunks. |
+| `seed`, `side`, `resampling_approximation`, `target_chunk_size`, `chunk_memory_gb`, `glm_solver` | The reference run's settings. `seed` is required, and the approximation must be `"skew_normal"`. |
+| `expected_fit_chunks`, `fit_chunk_ids` | The reference layout's `(width, count)`, refused when different, and the reference chunks this call fits, for a run split into shards. |
+| `gene_fits` | Gene fits to reuse (`pysceptre.pipeline.gene_cache`); a cache made with another `glm_solver` is refused. |
+| `p_exact_below`, `block_rows` | Where the first-stage early stop may stop, and how often it checks. |
+| `n_jobs`, `backend`, `fit_concurrency` | Workers for the tests, their backend, and target chunks fit at once. None of them changes a result. |
+
+Returns one row per pair, in `pairs` order: `response_id`, `grna_target`,
+`p_value`, `fold_change`, `se_fold_change`, `z_orig`, `stage`, `screen`,
+`p_value_floor` and `n_null_evaluated`, and `audit_*` columns for audited
+pairs. A pair with a fold change of at least 1 is not resampled (`screen`
+"fold_change"), and the first stage stops once a pair's p-value is known to
+be at least `p_exact_below` and the pair cannot escalate (`screen`
+"early_stop", the bound in `p_value_floor`): neither can be a call of the
+specificity check. A screened row's `p_value` is NaN and means "tested, not
+resampled", so use it for the check and not for a p-value distribution.
+Complement control group, CRT and the union strategy only. Why the cost is
+not per pair, and why both screens are exact, is in
+[Design decisions](https://broadinstitute.github.io/pysceptre/design/#the-trans-background).
 
 ### `pysceptre.assign_grnas`
 
@@ -739,15 +782,18 @@ Two limits on the CRT path, both worth knowing exactly:
 
 | change between runs | shared pairs |
 |---|---|
-| more or fewer targets or pairs; different order; different `target_chunk_size` or `n_jobs` | **bitwise identical** |
-| a different set of *genes* | identical to ~1e-16 |
+| more or fewer pairs of the same targets, or genes; a different pair order; different `n_jobs` | **bitwise identical** |
+| different target chunks: other targets, another order of `grna_target_cells`, or another `target_chunk_size` | **bitwise identical** with `glm_solver="structured"`; with the default `"outer"`, on some BLAS kernels a target's fitted probabilities differ in the last bits, which very rarely moves a resample |
+| another CPU type | the same to rounding, not bitwise |
 
-The second is batched linear algebra, not randomness: gene GLMs are fitted in
-batches, and changing the batch width changes the order of floating-point
-additions. Measured at one unit in the last place (1.11e-16 on `fold_change`,
-3 of 72 pairs) on OpenBLAS, and exactly zero on Apple Accelerate. It cannot
-be removed without fitting genes one at a time, which is the batching this
-package exists to do.
+Neither is randomness. Gene GLMs are fitted one gene at a time, so the set of
+genes never matters. Target GLMs are fitted a chunk at a time on the default
+route, and a batched BLAS product need not give one column the same last bits
+in every batch; `glm_solver="structured"` fits each target alone
+([Design decisions](https://broadinstitute.github.io/pysceptre/design/#indicator-columns-in-the-irls)).
+numpy and OpenBLAS choose their kernels by CPU model, so the same code gives
+different last bits on different machines
+([Design decisions](https://broadinstitute.github.io/pysceptre/design/#bits-depend-on-the-machine)).
 
 **Adjusted p-values are a different matter and must be recomputed.** A
 Benjamini-Hochberg adjustment depends on every p-value in the set, so adding

@@ -230,6 +230,102 @@ class ListDraws(StagedDraws):
         return self._idxs[lo:hi]
 
 
+class FlatDraws(StagedDraws):
+    """CRT draws held flat: every resample's cells in one array, with offsets.
+
+    Takes what `ListDraws` takes, the sampler's list of per-resample index
+    arrays, and keeps one concatenated cell array (int32 when `n_cells` is
+    below 2**31, int64 otherwise) and int64 offsets instead of the list. The
+    cell indices are checked once, here, and refused as `draws_to_matrix`
+    refuses them.
+
+    `slice(lo, hi)` returns the CSR matrix `draws_to_matrix` builds from
+    resamples `[lo, hi)`: the same data, indices and index pointers, so the
+    same matmul results bit for bit. It is built on each call and not
+    memoized, except for the row blocks `prebuild_blocks` builds: asked for
+    exactly one of those, `slice` returns it. Call `prebuild_blocks` once,
+    before the object is shared; after that nothing is written and the arrays
+    are read-only, so threads and forked workers share them without copies.
+    Callers must not modify a returned matrix in place.
+
+    For the trans background, where a target is held for a whole shard and
+    its first stage is read block by block. See docs/design.md, "The trans
+    background".
+    """
+
+    __slots__ = ("_cells", "_offsets", "_blocks")
+
+    def __init__(self, synthetic_idxs: list[np.ndarray], n_cells: int):
+        B = len(synthetic_idxs)
+        super().__init__(n_cells, B)
+        lengths = np.fromiter((len(idxs) for idxs in synthetic_idxs), dtype=np.int64, count=B)
+        offsets = np.zeros(B + 1, dtype=np.int64)
+        np.cumsum(lengths, out=offsets[1:])
+        cell_dtype = np.int32 if n_cells < 2**31 else np.int64
+        if offsets[-1]:
+            cells = np.concatenate(synthetic_idxs).astype(np.int64, copy=False)
+            if cells.min() < 0 or cells.max() >= n_cells:
+                # The same refusal as `draws_to_matrix`, made before the cast can wrap a value.
+                raise ValueError(
+                    f"resample cell indices out of range for n_cells={n_cells}: "
+                    f"[{cells.min()}, {cells.max()}]"
+                )
+            # `np.concatenate` returned a new array, so nothing here aliases the caller's.
+            cells = cells.astype(cell_dtype, copy=False)
+        else:
+            cells = np.empty(0, dtype=cell_dtype)
+        cells.flags.writeable = False
+        offsets.flags.writeable = False
+        self._cells = cells
+        self._offsets = offsets
+        self._blocks: dict[tuple[int, int], sparse.csr_matrix] = {}
+
+    def _index_arrays(self, lo: int, hi: int) -> list[np.ndarray]:
+        off = self._offsets
+        return [self._cells[off[i] : off[i + 1]] for i in range(lo, hi)]
+
+    def _matrix(self, lo: int, hi: int, ones: np.ndarray | None = None) -> sparse.csr_matrix:
+        start, stop = self._offsets[lo], self._offsets[hi]
+        indices = self._cells[start:stop]
+        indptr = self._offsets[lo : hi + 1] - start
+        data = np.ones(indices.size) if ones is None else ones[: indices.size]
+        return sparse.csr_matrix((data, indices, indptr), shape=(hi - lo, self.n_cells), copy=False)
+
+    def prebuild_blocks(self, B1: int, block_rows: int) -> None:
+        """Build the first stage's row blocks once, for `slice` to return.
+
+        The blocks are rows `[0, block_rows)`, `[block_rows, 2 * block_rows)`
+        and so on up to `B1` (or the number of draws, if smaller), the last
+        one possibly shorter: the slices `run_low_level_test_screened` asks
+        for with the same `B1` and `block_rows`. Call it once, before the
+        object is shared with threads or forked workers.
+        """
+        block_rows = int(block_rows)
+        if block_rows < 1:
+            raise ValueError(f"block_rows must be positive, got {block_rows!r}")
+        stop = min(int(B1), self.n_draws)
+        bounds = [(lo, min(lo + block_rows, stop)) for lo in range(0, stop, block_rows)]
+        off = self._offsets
+        # One array of ones the blocks' data share (scipy copies a view under half its base).
+        ones = np.ones(max((int(off[hi] - off[lo]) for lo, hi in bounds), default=0))
+        blocks = {}
+        for lo, hi in bounds:
+            m = self._matrix(lo, hi, ones)
+            for arr in (m.data, m.indices, m.indptr):
+                arr.flags.writeable = False
+            blocks[(lo, hi)] = m
+        self._blocks = blocks
+
+    def slice(self, lo: int, hi: int) -> sparse.csr_matrix:
+        lo, hi = max(0, int(lo)), min(int(hi), self.n_draws)
+        if hi <= lo:
+            return sparse.csr_matrix((0, self.n_cells))
+        hit = self._blocks.get((lo, hi))
+        if hit is not None:
+            return hit
+        return self._matrix(lo, hi)
+
+
 class PermutationSliceDraws(StagedDraws):
     """Permutation draws: a prefix of each row of one shared array.
 
@@ -418,6 +514,22 @@ def compute_null_statistics_from_draws(stacked: np.ndarray, draws: sparse.csr_ma
     if draws.nnz == 0:
         return np.full(draws.shape[0], np.nan)
     return statistics_from_segment_sums(draws @ stacked)  # (B, p + 2)
+
+
+def compute_null_statistics_block(stacked: np.ndarray, draws: sparse.csr_matrix) -> np.ndarray:
+    """The null statistics of a block of resamples, as rows of the whole stage's matmul.
+
+    `statistics_from_segment_sums(draws @ stacked)`, without the shortcut
+    `compute_null_statistics_from_draws` takes for a matrix with no entries:
+    that shortcut returns a NaN whose bits can differ from the NaN the matmul
+    gives an empty resample (they do on x86). Each row's statistic depends on that row alone,
+    so a stage evaluated in consecutive blocks gives, bit for bit and NaN
+    payloads included, the rows of one matmul over the stage. A block with no
+    rows gives an empty array. See docs/design.md, "The trans background".
+    """
+    if draws.shape[0] == 0:
+        return np.empty(0)
+    return statistics_from_segment_sums(draws @ stacked)
 
 
 def statistics_from_segment_sums(sums: np.ndarray) -> np.ndarray:

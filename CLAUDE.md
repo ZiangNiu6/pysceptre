@@ -102,8 +102,11 @@ src-layout -- the importable package lives under `src/`, so it is only on
 `sys.path` once installed (editable is fine).
 
 - `src/pysceptre/`
-  - `glm/`              -- batched IRLS (`irls.py`), NB dispersion (`nb_theta.py`)
-                           and the design-matrix rank check (`design.py`).
+  - `glm/`              -- batched IRLS (`irls.py`), with a structured route
+                           for designs with indicator columns
+                           (`glm_solver="structured"`), NB dispersion
+                           (`nb_theta.py`), and the design-matrix rank check
+                           and indicator grouping (`design.py`).
   - `precompute/`       -- per-gene precomputation pieces reused across draws.
   - `crt/`              -- the CRT samplers (`sampler.py`) and the permutation
                            draws every target shares (`permutations.py`).
@@ -114,6 +117,9 @@ src-layout -- the importable package lives under `src/`, so it is only on
                            entry points) and `grouping.py` (the gRNA
                            integration strategies, which are pair bookkeeping
                            only: nothing statistical differs between them).
+                           `trans.py` is the specificity check's background
+                           (`run_trans_analysis`), with `gene_cache.py` and
+                           `fingerprint.py` for gene fits reused across shards.
   - `analytical_power/` -- the closed-form per-pair power estimate, ported
                            from PerturbPlan (MIT, `THIRD_PARTY_LICENSES`). Not
                            from sceptre, and not part of the discovery path.
@@ -280,6 +286,12 @@ Python 3.10+ (`requires-python`). Verified passing on 3.10, 3.11, 3.12, 3.13.
   context manager (measured ratio 0.98). So local benchmarks on a
   Mac do not exercise this path, while CI (ubuntu-latest, OpenBLAS) does.
   Any measurement of this optimization must name the BLAS it was taken on.
+
+- **`glm_solver` defaults to `"outer"` on purpose.** `"structured"` fits the
+  same GLM to different last bits, so making it the default would move every
+  0.5.0 result. A reference run, its gene cache and its trans runs must share
+  one solver; the cache fingerprint records it. docs/design.md, "Indicator
+  columns in the IRLS".
 
 - **numba is optional and both code paths must keep working.**
   `crt/sampler.py` try/excepts the import and falls back to a pure-numpy

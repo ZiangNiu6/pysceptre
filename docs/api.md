@@ -1,7 +1,7 @@
 # API reference
 
-Generated from the source. Eleven functions make up the public API, and all
-eleven are importable from the top level (`from pysceptre import
+Generated from the source. Twelve functions make up the public API, and all
+twelve are importable from the top level (`from pysceptre import
 run_discovery_analysis`) as well as from their defining module.
 
 !!! note "Reading these signatures"
@@ -64,6 +64,13 @@ elements and genes on other chromosomes. Not from sceptre; see
 ::: pysceptre.specificity.check.run_specificity_check
 
 ::: pysceptre.specificity.check.SpecificityResult
+
+### Its background
+
+The trans pairs the check reads, tested with the cis run's own test. Not from
+sceptre; see [Design decisions](design.md#the-trans-background).
+
+::: pysceptre.pipeline.api.run_trans_analysis
 
 ### Its pieces
 

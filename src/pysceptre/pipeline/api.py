@@ -27,6 +27,7 @@ from .calibration import (
 from .discovery import (
     _DEFAULT_CHUNK_MEMORY_GB,
     _DEFAULT_TARGET_CHUNK_SIZE,
+    GLM_SOLVERS,
     run_discovery_nt_cells,
     run_discovery_ntcells_complement,
 )
@@ -206,6 +207,7 @@ def run_discovery_analysis(
     n_jobs: int = 1,
     resampling_mechanism: str | None = None,
     grna_target_weights: dict[str, np.ndarray] | None = None,
+    glm_solver: str = "outer",
 ) -> pd.DataFrame:
     """response_matrix: (n_genes, n_cells) dense ndarray or scipy.sparse matrix.
     gene_ids: row labels for response_matrix, in order.
@@ -254,12 +256,13 @@ def run_discovery_analysis(
         distributed, so the resampling draws are made in the same order
         whatever the worker count. Memory grows by roughly one gene's working
         arrays per worker, not by `chunk_memory_gb` per worker.
-    chunk_memory_gb: budget for the gRNA-target chunk's arrays. **It cannot
-        change a result**: it sizes target chunking only, and the binomial fit
-        is bitwise identical across chunk widths (verified at 14 against 114
-        on 567,690 cells). Gene fitting uses a fixed internal budget precisely
-        so that this knob stays numerical-free -- driving both from it meant
-        raising the budget moved 2 of 237 gene fits on day0. Budget for the
+    chunk_memory_gb: budget for the gRNA-target chunk's arrays. It sizes
+        target chunking only; gene fits do not use it. With
+        `glm_solver="structured"` it cannot change a result. With the default
+        `"outer"` a chunk's targets are fit as one batch, and on some BLAS
+        kernels a target's fitted probabilities differ in the last bits with
+        its chunk-mates, which very rarely moves a resample (docs/design.md,
+        "Target fits no longer depend on their chunk-mates"). Budget for the
         arrays a chunk holds, which sizes how many
         genes or targets are processed together. Not a cap on the process's
         memory -- the input, retained state and allocator overhead sit outside
@@ -272,6 +275,15 @@ def run_discovery_analysis(
         finite and positive; all-ones weights give sceptre's result exactly. Complement control
         group, CRT and `grna_integration_strategy="union"` only. Not from sceptre:
         `docs/design.md`, "The dose test".
+    glm_solver: how the gene and target GLMs are fit. `"outer"` (the default)
+        is 0.5.0's IRLS over the per-row outer products of the covariate
+        matrix; `"structured"` forms the same normal equations from the
+        design's indicator columns by per-level sums, which on a design with
+        many one-hot covariates is far cheaper and needs no `(n_cells, p^2)`
+        array. The same GLM, not the same bits: a gene whose counts are close
+        to Poisson can get a different `theta`, as it can on another CPU.
+        Complement control group only. See docs/design.md, "Indicator columns
+        in the IRLS".
     """
     control_group, resampling_mechanism = resolve_analysis_settings(
         moi, control_group, resampling_mechanism
@@ -296,6 +308,7 @@ def run_discovery_analysis(
         n_jobs=n_jobs,
         resampling_mechanism=resampling_mechanism,
         grna_target_weights=grna_target_weights,
+        glm_solver=glm_solver,
     )
 
 
@@ -320,6 +333,7 @@ def _run_discovery(
     resampling_mechanism: str,
     permutation_width: int | None = None,
     grna_target_weights: dict[str, np.ndarray] | None = None,
+    glm_solver: str = "outer",
 ) -> pd.DataFrame:
     """`run_discovery_analysis` once the settings are resolved.
 
@@ -430,13 +444,20 @@ def _run_discovery(
             "the dose test (grna_target_weights) runs with the complement control group, the CRT "
             "and grna_integration_strategy='union' only"
         )
+    if glm_solver not in GLM_SOLVERS:
+        raise ValueError(f"glm_solver must be one of {GLM_SOLVERS}, got {glm_solver!r}")
     if nt_cells is None:
         result = run_discovery_ntcells_complement(
             **engine_args,
             permutation_width=permutation_width,
             grna_target_weights=grna_target_weights,
+            glm_solver=glm_solver,
         )
     else:
+        if glm_solver != "outer":
+            raise ValueError(
+                f"glm_solver={glm_solver!r} is available with the complement control group only"
+            )
         result = run_discovery_nt_cells(**engine_args, nt_cells=nt_cells)
     if not per_guide:
         return result
@@ -476,6 +497,7 @@ def run_calibration_check(
     n_jobs: int = 1,
     resampling_mechanism: str | None = None,
     ntc_grna_weights: dict[str, np.ndarray] | None = None,
+    glm_solver: str = "outer",
 ) -> pd.DataFrame:
     """Run sceptre's calibration check: the discovery test over negative controls.
 
@@ -514,6 +536,7 @@ def run_calibration_check(
         dose test instead of sceptre's: a synthetic target's cell takes its largest weight over
         the group's gRNAs (`DoseWeights.ntc_grna_weights`). Complement control group and CRT only,
         as in `run_discovery_analysis`.
+    glm_solver: as in `run_discovery_analysis`.
 
     Returns the same columns as `run_discovery_analysis`.
     """
@@ -626,6 +649,7 @@ def run_calibration_check(
         resampling_mechanism=resampling_mechanism,
         permutation_width=permutation_width,
         grna_target_weights=synthetic_target_weights,
+        glm_solver=glm_solver,
     )
 
 
@@ -650,6 +674,7 @@ def run_power_check(
     n_jobs: int = 1,
     resampling_mechanism: str | None = None,
     grna_target_weights: dict[str, np.ndarray] | None = None,
+    glm_solver: str = "outer",
 ) -> pd.DataFrame:
     """Run sceptre's power check: the discovery test over positive controls.
 
@@ -674,8 +699,8 @@ def run_power_check(
         overstate power by hiding the controls the screen had too few cells
         to test. With `control_group="nt_cells"` the control count is the
         gene's nonzero NT cells, as in R.
-    moi, control_group, ntc_grna_cells, resampling_mechanism, grna_target_weights: as in
-        `run_discovery_analysis`, with the same MOI-dependent defaults.
+    moi, control_group, ntc_grna_cells, resampling_mechanism, grna_target_weights, glm_solver:
+        as in `run_discovery_analysis`, with the same MOI-dependent defaults.
 
     Returns one row per supplied pair, with `pass_qc`, `n_nonzero_trt` and
     `n_nonzero_cntrl` alongside the usual columns. No multiple-testing
@@ -736,8 +761,96 @@ def run_power_check(
         n_jobs=n_jobs,
         resampling_mechanism=resampling_mechanism,
         grna_target_weights=grna_target_weights,
+        glm_solver=glm_solver,
     )
     return merge_qc_failures(tested, annotated)
+
+
+def run_trans_analysis(
+    response_matrix,
+    gene_ids: list[str],
+    covariate_matrix: np.ndarray,
+    grna_target_cells: dict[str, np.ndarray],
+    pairs: pd.DataFrame,
+    *,
+    reference_pairs: pd.DataFrame,
+    seed: int,
+    side: str = "both",
+    resampling_approximation: str = "skew_normal",
+    target_chunk_size: int = _DEFAULT_TARGET_CHUNK_SIZE,
+    chunk_memory_gb: float = _DEFAULT_CHUNK_MEMORY_GB,
+    expected_fit_chunks: tuple[int, int] | None = None,
+    fit_chunk_ids=None,
+    gene_fits=None,
+    p_exact_below: float = 0.05,
+    block_rows: int = 32,
+    n_jobs: int = 1,
+    backend: str | None = None,
+    fit_concurrency: int = 3,
+    glm_solver: str = "outer",
+) -> pd.DataFrame:
+    """Test background pairs with a reference discovery run's test, for `run_specificity_check`.
+
+    Every pair in `pairs` is tested as the reference run, which was given
+    `reference_pairs` and the same data, seed and settings, would test it:
+    targets are fit in the reference run's own chunks, so a pair tested in full
+    gets the result `run_discovery_analysis` gives it, bit for bit on the same
+    CPU and BLAS. Not from sceptre; see docs/design.md, "The trans background".
+
+    Two screens skip work the specificity check cannot see, and are exact for
+    every table it returns. A pair with `fold_change >= 1` is not resampled
+    (`screen` "fold_change"), and the first resampling stage stops once the
+    p-value is known to be at least `p_exact_below` and the pair cannot
+    escalate (`screen` "early_stop", with that bound in `p_value_floor`). A
+    screened pair has `p_value` NaN, which here means "tested, not resampled".
+    A `mode` column in `pairs` selects per pair "screened" (the default),
+    "full" (no screen) or "audit" (screened, with the full result beside it in
+    the `audit_*` columns).
+
+    Complement control group, CRT, `skew_normal`, union strategy only; `seed`
+    is required. `expected_fit_chunks` is the reference layout's
+    `(width, count)`, refused when different; `fit_chunk_ids` selects
+    reference chunks for a run split into shards; `gene_fits` reuses width-1
+    gene fits (see `pysceptre.pipeline.gene_cache`). `glm_solver` must be the
+    reference run's (see `run_discovery_analysis`); a `GeneFitCache` made with
+    another is refused, a plain dict of fits is not checked. `n_jobs`,
+    `backend` and `fit_concurrency` (target chunks fit at once) cannot change
+    a result. `iter_trans_analysis` yields the same results one gene at a
+    time, for runs too large to hold as one table.
+
+    Returns:
+        `response_id`, `grna_target`, `p_value`, `fold_change`,
+        `se_fold_change`, `z_orig`, `stage`, `screen`, `p_value_floor`,
+        `n_null_evaluated`, and the `audit_*` columns when a pair was audited;
+        one row per pair, in `pairs` order.
+    """
+    from .trans import iter_trans_analysis, trans_results_frame
+
+    return trans_results_frame(
+        pairs,
+        iter_trans_analysis(
+            response_matrix,
+            gene_ids,
+            covariate_matrix,
+            grna_target_cells,
+            pairs,
+            reference_pairs=reference_pairs,
+            seed=seed,
+            side=side,
+            resampling_approximation=resampling_approximation,
+            target_chunk_size=target_chunk_size,
+            chunk_memory_gb=chunk_memory_gb,
+            expected_fit_chunks=expected_fit_chunks,
+            fit_chunk_ids=fit_chunk_ids,
+            gene_fits=gene_fits,
+            p_exact_below=p_exact_below,
+            block_rows=block_rows,
+            n_jobs=n_jobs,
+            backend=backend,
+            fit_concurrency=fit_concurrency,
+            glm_solver=glm_solver,
+        ),
+    )
 
 
 def _resampling_budget(

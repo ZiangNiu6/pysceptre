@@ -333,7 +333,159 @@ class BackedResponseMatrix:
         self.close()
 
 
-def subset_to_cells_in_use(export: SceptreExport) -> SceptreExport:
+class CompactResponseMatrix:
+    """Some genes of a response matrix, held in memory with 32-bit cell indices.
+
+    Rows are CSR blocks of consecutive rows, each holding fewer than 2**31
+    stored entries so that scipy keeps 32-bit indices and pointers, with the
+    counts in the file's own integer type. A row reads back exactly as the
+    full matrix's row does, so an analysis gives the same numbers; only memory
+    changes. Exposes what the engine reads: `shape`, `dtype`, `nnz`,
+    `__getitem__` (a row or a slice of rows) and `rows(start, stop)`.
+    """
+
+    def __init__(self, blocks: list[sparse.csr_matrix], n_cells: int):
+        self._blocks = blocks
+        self._starts = np.cumsum([0] + [b.shape[0] for b in blocks]).astype(np.int64)
+        self.shape = (int(self._starts[-1]), int(n_cells))
+        self.dtype = blocks[0].dtype if blocks else np.dtype(np.float64)
+        self.nnz = int(sum(b.nnz for b in blocks))
+
+    def rows(self, start: int, stop: int) -> sparse.csr_matrix:
+        """Rows `[start, stop)` as one CSR matrix."""
+        start, stop = int(start), int(min(stop, self.shape[0]))
+        if stop <= start:
+            return sparse.csr_matrix((0, self.shape[1]), dtype=self.dtype)
+        parts = []
+        b = int(np.searchsorted(self._starts, start, side="right") - 1)
+        while start < stop:
+            base = int(self._starts[b])
+            end = min(stop, int(self._starts[b + 1]))
+            parts.append(self._blocks[b][start - base : end - base])
+            start, b = end, b + 1
+        return parts[0] if len(parts) == 1 else sparse.vstack(parts, format="csr")
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            if i.step not in (None, 1):
+                raise IndexError("only contiguous row slices are supported")
+            return self.rows(i.start or 0, self.shape[0] if i.stop is None else i.stop)
+        i = int(i)
+        if not 0 <= i < self.shape[0]:
+            raise IndexError(f"row {i} out of range for {self.shape[0]} rows")
+        return self.rows(i, i + 1)
+
+    def toarray(self):
+        raise NotImplementedError("refusing to densify; read rows with rows(start, stop)")
+
+
+_MAX_BLOCK_ENTRIES = 2**31 - 1
+
+
+def load_export_compact(
+    path: str | Path, genes=None, *, read_entries: int = 1 << 27
+) -> SceptreExport:
+    """`load_export` for an analysis that reads some genes: those genes only, cells in use only.
+
+    The response matrix becomes a `CompactResponseMatrix`: the selected genes
+    (file order; all genes when `genes` is None, and the genes of the
+    export's own `pairs` when it is "pairs"), restricted to the cells in
+    use and re-indexed to them, with 32-bit cell indices. The file is read
+    once, in contiguous runs of selected genes of about `read_entries` stored
+    entries, so peak memory is the result plus one run. Everything else is
+    what `load_export` returns, in the cells-in-use space, with `gene_ids`
+    the selected genes. Each selected row equals that gene's row from
+    `load_export`, value for value.
+
+    Raises:
+        KeyError: a requested gene is not in the file.
+    """
+    path = Path(path)
+    h5 = path if path.is_file() else path / "dataset.h5mu"
+    export = load_h5mu(h5, backed=True, all_cells=True)
+    backed = export.response_matrix
+    n_all = backed.shape[1]
+    in_use = (
+        np.ones(n_all, dtype=bool)
+        if export.in_use is None
+        else np.asarray(export.in_use, dtype=bool)
+    )
+    new_pos = np.cumsum(in_use) - 1
+    n_keep = int(in_use.sum())
+    if isinstance(genes, str) and genes == "pairs":
+        genes = set(export.pairs["response_id"])
+    if genes is None:
+        rows = list(range(backed.shape[0]))
+    else:
+        wanted = set(genes)
+        missing = sorted(wanted - set(export.gene_ids))
+        if missing:
+            raise KeyError(f"{len(missing)} gene(s) not in {h5}, e.g. {missing[:5]}")
+        rows = [i for i, g in enumerate(export.gene_ids) if g in wanted]
+
+    blocks: list[sparse.csr_matrix] = []
+    data_parts: list[np.ndarray] = []
+    idx_parts: list[np.ndarray] = []
+    lengths: list[int] = []
+    held = 0
+
+    def flush() -> None:
+        nonlocal held
+        if not lengths:
+            return
+        indptr = np.zeros(len(lengths) + 1, dtype=np.int32)
+        np.cumsum(lengths, out=indptr[1:])
+        blocks.append(
+            sparse.csr_matrix(
+                (np.concatenate(data_parts), np.concatenate(idx_parts), indptr),
+                shape=(len(lengths), n_keep),
+            )
+        )
+        data_parts.clear()
+        idx_parts.clear()
+        lengths.clear()
+        held = 0
+
+    indptr_all = backed._indptr
+    run_start = 0
+    while run_start < len(rows):
+        # A run of consecutive selected rows, cut at about `read_entries` stored entries.
+        run_end = run_start + 1
+        while (
+            run_end < len(rows)
+            and rows[run_end] == rows[run_end - 1] + 1
+            and indptr_all[rows[run_end] + 1] - indptr_all[rows[run_start]] <= read_entries
+        ):
+            run_end += 1
+        first, last = rows[run_start], rows[run_end - 1] + 1
+        chunk = backed.rows(first, last)
+        for r in range(last - first):
+            lo, hi = chunk.indptr[r], chunk.indptr[r + 1]
+            cells = chunk.indices[lo:hi]
+            keep = in_use[cells]
+            idx = new_pos[cells[keep]].astype(np.int32)
+            val = chunk.data[lo:hi][keep]
+            if held + idx.size > _MAX_BLOCK_ENTRIES:
+                flush()
+            data_parts.append(val)
+            idx_parts.append(idx)
+            lengths.append(int(idx.size))
+            held += int(idx.size)
+        run_start = run_end
+    flush()
+    backed.close()
+
+    matrix = CompactResponseMatrix(blocks, n_keep)
+    selected = [export.gene_ids[i] for i in rows]
+    metadata = dict(export.metadata)
+    metadata["genes_loaded"] = len(selected)
+    return subset_to_cells_in_use(
+        replace(export, response_matrix=matrix, gene_ids=selected, metadata=metadata),
+        matrix_in_use=True,
+    )
+
+
+def subset_to_cells_in_use(export: SceptreExport, *, matrix_in_use: bool = False) -> SceptreExport:
     """Bring an `--all-cells` export back to the QC-passing cells.
 
     A file written with `--all-cells` is in one consistent space -- matrix
@@ -349,6 +501,8 @@ def subset_to_cells_in_use(export: SceptreExport) -> SceptreExport:
     in_use = np.asarray(export.in_use, dtype=bool)
     if in_use.all():
         return export
+    # `matrix_in_use`: the response matrix is already restricted to the cells in use
+    # (`load_export_compact`), and only the rest of the export moves.
 
     keep = np.flatnonzero(in_use)
     new_pos = np.cumsum(in_use) - 1
@@ -363,7 +517,7 @@ def subset_to_cells_in_use(export: SceptreExport) -> SceptreExport:
         return {unit: remap_one(idxs) for unit, idxs in cells.items()}
 
     matrix = export.response_matrix
-    if hasattr(matrix, "rows"):
+    if hasattr(matrix, "rows") and not isinstance(matrix, CompactResponseMatrix):
         raise ValueError(
             "this dataset was written with --all-cells and a backed read cannot subset it to "
             "cells_in_use: BackedResponseMatrix serves columns straight from the file. Load it "
@@ -374,12 +528,12 @@ def subset_to_cells_in_use(export: SceptreExport) -> SceptreExport:
 
     metadata = dict(export.metadata)
     metadata["n_cells"] = int(keep.size)
-    metadata["n_nonzero"] = int(matrix[:, keep].nnz)
+    metadata["n_nonzero"] = int(matrix.nnz if matrix_in_use else matrix[:, keep].nnz)
     metadata["all_cells"] = False
 
     return replace(
         export,
-        response_matrix=matrix[:, keep].tocsr(),
+        response_matrix=matrix if matrix_in_use else matrix[:, keep].tocsr(),
         covariate_matrix=export.covariate_matrix[keep],
         grna_target_cells=remap(export.grna_target_cells),
         ntc_grna_cells=remap(export.ntc_grna_cells),

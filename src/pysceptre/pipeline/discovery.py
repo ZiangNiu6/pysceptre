@@ -26,6 +26,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import itertools
+import json
 import os
 import sys
 import threading
@@ -41,11 +42,16 @@ from scipy import sparse
 
 from ..crt.permutations import nested_permutation_draws, permutation_draws
 from ..crt.sampler import crt_index_sampler
-from ..glm.design import redundant_columns
+from ..glm.design import StructuredDesign, redundant_columns, structured_design
 from ..glm.irls import (
     fit_binomial_glm_batch,
+    fit_binomial_glm_structured,
     fit_poisson_glm_batch,
+    fit_poisson_glm_structured,
     one_blas_thread,
+    structured_linear_predictor,
+    structured_normal_equations,
+    warm_compiled_sums,
     x_outer_flat,
 )
 from ..glm.nb_theta import estimate_theta
@@ -282,6 +288,7 @@ def _gene_fit_job(job: tuple[int, list[str], list[int]]) -> dict[str, GenePrecom
     covariate_matrix = st["covariate_matrix"]
     dfr = st["dfr"]
     xo = st["x_outer_flat"]
+    design = st.get("design")
     n_cells = covariate_matrix.shape[0]
 
     contiguous = chunk_rows == list(range(chunk_rows[0], chunk_rows[0] + len(chunk_rows)))
@@ -295,29 +302,53 @@ def _gene_fit_job(job: tuple[int, list[str], list[int]]) -> dict[str, GenePrecom
         for j, row in enumerate(chunk_rows):
             Y[j] = _get_row(response_matrix, row)
 
-    fit = fit_poisson_glm_batch(covariate_matrix, Y, X_outer_flat=xo)
+    if design is None:
+        fit = fit_poisson_glm_batch(covariate_matrix, Y, X_outer_flat=xo)
+        coefs, fitted, converged = fit.coefs, fit.fitted_values, fit.converged
+    else:
+        fits = [fit_poisson_glm_structured(design, Y[j]) for j in range(len(chunk_ids))]
+        coefs = [f.coefs for f in fits]
+        fitted = [f.fitted_values for f in fits]
+        converged = [f.converged for f in fits]
 
     out: dict[str, GenePrecomputation] = {}
     for j, gene_id in enumerate(chunk_ids):
         y_j = Y[j]
-        theta_est, method = estimate_theta(y=y_j, mu=fit.fitted_values[j], dfr=dfr)
+        theta_est, method = estimate_theta(y=y_j, mu=fitted[j], dfr=dfr)
         lo, hi = _THETA_BOUNDS
         theta = max(min(theta_est, hi), lo)
-        # Built here only to read off the conditioning diagnostics, then
-        # dropped -- see GenePrecomputation. It is rebuilt per gene per target
-        # chunk in run_discovery_ntcells_complement.
-        pieces = compute_precomputation_pieces(y_j, covariate_matrix, fit.coefs[j], theta)
+        if design is None:
+            # Built here only to read off the conditioning diagnostics, then
+            # dropped -- see GenePrecomputation. It is rebuilt per gene per
+            # target chunk in run_discovery_ntcells_complement.
+            pieces = compute_precomputation_pieces(y_j, covariate_matrix, coefs[j], theta)
+            min_ev, max_ev, n_cov = pieces.min_eigenvalue, pieces.max_eigenvalue, pieces.D.shape[0]
+        else:
+            min_ev, max_ev = _structured_conditioning(design, coefs[j], theta)
+            n_cov = design.p
         out[gene_id] = GenePrecomputation(
-            fitted_coefs=fit.coefs[j],
+            fitted_coefs=coefs[j],
             theta=theta,
             theta_method=method,
             theta_clamped=not (lo <= theta_est <= hi),
-            glm_converged=bool(fit.converged[j]),
-            min_eigenvalue=pieces.min_eigenvalue,
-            max_eigenvalue=pieces.max_eigenvalue,
-            n_covariates=pieces.D.shape[0],
+            glm_converged=bool(converged[j]),
+            min_eigenvalue=min_ev,
+            max_eigenvalue=max_ev,
+            n_covariates=n_cov,
         )
     return out
+
+
+def _structured_conditioning(
+    design: StructuredDesign, coefs: np.ndarray, theta: float
+) -> tuple[float, float]:
+    """Extreme eigenvalues of `Zt_wZ` under the negative-binomial weights, as
+    `compute_precomputation_pieces` reports them, from the structured normal equations."""
+    mu = np.exp(structured_linear_predictor(design, coefs))
+    w = mu / (1 + mu / theta)
+    A, _ = structured_normal_equations(design, w, np.zeros(design.n))
+    eigvals = np.linalg.eigvalsh(A)
+    return float(eigvals[0]), float(eigvals[-1])
 
 
 def fit_all_genes(
@@ -330,6 +361,7 @@ def fit_all_genes(
     batch_width: int | None = None,
     n_jobs: int = 1,
     x_outer_flat_shared: np.ndarray | None = None,
+    design: StructuredDesign | None = None,
 ) -> dict[str, GenePrecomputation]:
     """Batched Poisson IRLS across genes (they share the full covariate
     matrix), then per-gene theta estimation and precomputation pieces.
@@ -360,6 +392,12 @@ def fit_all_genes(
     differently-shaped matmul that BLAS may block and accumulate differently.
     Measured exactly 0.0 on macOS/Accelerate and nonzero in the last bits on
     Linux/OpenBLAS. Don't assert bitwise equality across batch widths.
+
+    `design`, from `glm.design.structured_design`, fits each gene with the
+    structured IRLS instead (`glm.irls.fit_poisson_glm_structured`), one gene
+    at a time whatever the batch width, and needs no `x_outer_flat_shared`.
+    The same GLM, not the same bits; see docs/design.md, "Indicator columns
+    in the IRLS".
     """
     n_cells = covariate_matrix.shape[0]
     dfr = covariate_matrix.shape[0] - covariate_matrix.shape[1]
@@ -383,7 +421,8 @@ def fit_all_genes(
         # Built once by the caller and shared by every fit; see
         # `glm.irls.x_outer_flat`. Inherited by forked workers, shared by
         # threads, so it crosses no boundary either way.
-        x_outer_flat=x_outer_flat_shared,
+        x_outer_flat=None if design is not None else x_outer_flat_shared,
+        design=design,
     )
     out: dict[str, GenePrecomputation] = {}
     try:
@@ -662,6 +701,7 @@ def fit_all_targets(
     permutations: np.ndarray | None = None,
     x_outer_flat_shared: np.ndarray | None = None,
     grna_target_weights: dict[str, np.ndarray] | None = None,
+    design: StructuredDesign | None = None,
 ) -> dict[str, TargetPrecomputation]:
     """Per-target resamples, plus the logistic fit the CRT draws them from.
 
@@ -675,6 +715,11 @@ def fit_all_targets(
     `target_seed_sequence`. That makes the draws independent of the order
     targets are processed in and of which other targets are present, and is
     what lets them be computed in parallel at all.
+
+    `design`, from `glm.design.structured_design`, fits each target alone
+    with the structured IRLS (`glm.irls.fit_binomial_glm_structured`), so a
+    target's fit no longer depends on its chunk-mates; see docs/design.md,
+    "Indicator columns in the IRLS".
     """
     n_cells = covariate_matrix.shape[0]
     target_ids = list(grna_target_cells.keys())
@@ -694,7 +739,28 @@ def fit_all_targets(
     # discarded work is a dense fit over all 3,026 tested targets x 567,690
     # cells, taken a chunk at a time.
     fitted_values = None
-    if permutations is None:
+    if permutations is None and design is not None:
+        fitted_values = np.empty((len(target_ids), n_cells))
+
+        def fit_one(k: int) -> None:
+            y = np.zeros(n_cells)
+            y[grna_target_cells[target_ids[k]]] = 1.0
+            fitted_values[k] = fit_binomial_glm_structured(design, y).fitted_values
+
+        # Each target's fit is its own, so threads change no value; the
+        # compiled per-level sums release the GIL. One outer BLAS limit, as
+        # concurrent fits need (`glm.irls.one_blas_thread`). Each fit in
+        # flight holds about 10 + d vectors of `n_cells` floats, which
+        # `chunk_memory_gb` does not count.
+        workers = max(1, min(resolve_n_jobs(n_jobs), len(target_ids)))
+        with one_blas_thread():
+            if workers == 1:
+                for k in range(len(target_ids)):
+                    fit_one(k)
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    list(ex.map(fit_one, range(len(target_ids))))
+    elif permutations is None:
         # Target-major, matching the gene fit and glm/irls.py's convention.
         Y = np.zeros((len(target_ids), n_cells))
         for k, target_id in enumerate(target_ids):
@@ -895,6 +961,72 @@ def _resolve_target_chunk_size(
         )
     warnings.warn(message, stacklevel=3)
     return fitted
+
+
+def reference_fit_chunks(
+    grna_target_cells: dict[str, np.ndarray],
+    pairs: pd.DataFrame,
+    n_cells: int,
+    *,
+    B_total: int,
+    target_chunk_size: int,
+    chunk_memory_gb: float,
+    resampling_mechanism: str = "crt",
+) -> list[list[str]]:
+    """The target chunks `run_discovery_ntcells_complement` fits and draws together.
+
+    The targets are those of `grna_target_cells`, in its order, that some row
+    of `pairs["grna_target"]` names, cut into consecutive slices. On the CRT
+    path the width is `target_chunk_size` clamped to `chunk_memory_gb` for
+    `B_total` (B1 + B2 + B3) resamples over `n_cells` cells, which warns when
+    it reduces the width; on the permutation path it is every target in one
+    chunk unless a `target_chunk_size` other than the default was asked for.
+
+    The complement engine builds its chunks with this function, so a caller
+    that passes the same `grna_target_cells` (same order), pairs and settings
+    gets the same chunks. Under `glm_solver="outer"` a target's batched
+    logistic fit depends on its chunk-mates in the last bits, so reproducing a
+    run's target fits needs its chunks; under `"structured"` it does not. See
+    docs/design.md, "The trans background".
+
+    Raises:
+        ValueError: `resampling_mechanism` is neither "crt" nor "permutations".
+    """
+    if resampling_mechanism not in ("crt", "permutations"):
+        raise ValueError(
+            f"resampling_mechanism must be 'crt' or 'permutations', got {resampling_mechanism!r}"
+        )
+    # Membership as in the engine's `pairs.groupby("grna_target", observed=True)`:
+    # observed values only, missing ones dropped.
+    named = set(pd.unique(pairs["grna_target"].dropna()))
+    target_ids = [t for t in grna_target_cells if t in named]
+    if resampling_mechanism == "crt":
+        width = _resolve_target_chunk_size(
+            n_cells,
+            B_total,
+            [len(grna_target_cells[t]) for t in target_ids],
+            len(target_ids),
+            target_chunk_size,
+            chunk_memory_gb,
+        )
+    elif target_chunk_size == _DEFAULT_TARGET_CHUNK_SIZE:
+        width = max(1, len(target_ids))
+    else:
+        width = target_chunk_size
+    return [target_ids[i : i + width] for i in range(0, len(target_ids), width)]
+
+
+def chunk_layout_hash(chunks: list[list[str]]) -> str:
+    """sha256 hex digest of a chunk layout: its chunks in order, each chunk's target ids in order.
+
+    The ids are encoded as a JSON list of lists of strings, so chunk boundaries
+    and id boundaries cannot be confused, and moving one target to another
+    chunk or another position changes the digest.
+    """
+    encoded = json.dumps(
+        [[str(t) for t in chunk] for chunk in chunks], ensure_ascii=False, separators=(",", ":")
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 # Populated by the orchestrator immediately before a chunk's genes are mapped,
@@ -1140,6 +1272,19 @@ def _one_analysis_at_a_time(engine):
     return serialized
 
 
+GLM_SOLVERS = ("outer", "structured")
+
+
+def _design_for(glm_solver: str, covariate_matrix: np.ndarray) -> StructuredDesign | None:
+    """The structured design for `glm_solver="structured"`, None for 0.5.0's outer-product IRLS."""
+    if glm_solver not in GLM_SOLVERS:
+        raise ValueError(f"glm_solver must be one of {GLM_SOLVERS}, got {glm_solver!r}")
+    if glm_solver != "structured":
+        return None
+    warm_compiled_sums()
+    return structured_design(covariate_matrix)
+
+
 @_one_analysis_at_a_time
 def run_discovery_ntcells_complement(
     response_matrix,
@@ -1161,6 +1306,7 @@ def run_discovery_ntcells_complement(
     permutations: np.ndarray | None = None,
     permutation_width: int | None = None,
     grna_target_weights: dict[str, np.ndarray] | None = None,
+    glm_solver: str = "outer",
 ) -> pd.DataFrame:
     """pairs: DataFrame with columns 'response_id', 'grna_target' -- the
     QC-passed pairs to test. Returns a DataFrame with one row per pair:
@@ -1213,14 +1359,17 @@ def run_discovery_ntcells_complement(
     # One per run. Every fit in the analysis -- 237 gene fits and one per
     # target chunk, ~454 calls on day0 -- reads the same design matrix, and
     # this is the only part of the IRLS setup that depends on nothing else.
-    # See `glm.irls.x_outer_flat`.
-    shared_x_outer = x_outer_flat(covariate_matrix)
+    # See `glm.irls.x_outer_flat`. The structured solver needs neither it nor
+    # chunk-mates; see docs/design.md, "Indicator columns in the IRLS".
+    design = _design_for(glm_solver, covariate_matrix)
+    shared_x_outer = None if design is not None else x_outer_flat(covariate_matrix)
 
     gene_precomps = fit_all_genes(
         response_matrix,
         needed_gene_ids,
         covariate_matrix,
         x_outer_flat_shared=shared_x_outer,
+        design=design,
         # One gene per BLAS call, so a fit depends on nothing but that gene.
         # See `_GENE_BATCH_WIDTH`. The caller's `chunk_memory_gb` governs
         # target chunking only, which is result-neutral.
@@ -1290,23 +1439,25 @@ def run_discovery_ntcells_complement(
     #
     # The CRT is chunked as before: its draws are genuinely per-target and
     # large, which is what the budget is for.
-    if permutations is None:
-        target_chunk_size = _resolve_target_chunk_size(
-            covariate_matrix.shape[0],
-            B1 + B2 + B3,
-            [len(grna_target_cells[t]) for t in target_ids_needed],
-            len(target_ids_needed),
-            target_chunk_size,
-            chunk_memory_gb,
-        )
-    elif target_chunk_size == _DEFAULT_TARGET_CHUNK_SIZE:
-        target_chunk_size = max(1, len(target_ids_needed))
-    # An explicitly requested chunk size is still honoured on this path, even
-    # though nothing here needs bounding. It costs only speed, results are
-    # invariant to it either way, and silently ignoring a caller's memory
-    # knob is worse than being slower than necessary -- it is also what
+    #
+    # An explicitly requested chunk size is still honoured on the permutation
+    # path, even though nothing there needs bounding. It costs only speed,
+    # results are invariant to it either way, and silently ignoring a caller's
+    # memory knob is worse than being slower than necessary -- it is also what
     # `test_permutations_do_not_depend_on_chunking_or_workers` exercises, and
     # a knob that no longer moves anything makes that test vacuous.
+    #
+    # `reference_fit_chunks` is the one place the layout is decided, so a
+    # caller can rebuild this run's chunks without running it.
+    chunks = reference_fit_chunks(
+        grna_target_cells,
+        pairs,
+        covariate_matrix.shape[0],
+        B_total=B1 + B2 + B3,
+        target_chunk_size=target_chunk_size,
+        chunk_memory_gb=chunk_memory_gb,
+        resampling_mechanism="crt" if permutations is None else "permutations",
+    )
 
     gene_row_index = {gene_id: i for i, gene_id in enumerate(gene_ids)}
     pairs_by_gene: dict[str, list[str]] = {}
@@ -1358,10 +1509,8 @@ def run_discovery_ntcells_complement(
             n_jobs=prep_draw_jobs,
             permutations=permutations,
             x_outer_flat_shared=shared_x_outer,
+            design=design,
         )
-
-    starts = list(range(0, len(target_ids_needed), target_chunk_size))
-    chunks = [target_ids_needed[i : i + target_chunk_size] for i in starts]
 
     rows = _run_target_chunks(
         chunks,

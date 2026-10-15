@@ -1,6 +1,8 @@
-"""Rank of a design matrix, and which of its columns are redundant."""
+"""Rank of a design matrix, which of its columns are redundant, and its indicator structure."""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -83,4 +85,113 @@ def validate_design_matrix(covariate_matrix: np.ndarray, n_cells: int | None = N
         "contrast (a factor's full dummy set alongside an intercept), a duplicated column, or "
         "a covariate that is constant within another's levels. Drop the named column(s), or "
         "build the design with one reference level held out."
+    )
+
+
+@dataclass(frozen=True)
+class IndicatorGroup:
+    """Columns of a design matrix that are 0/1 and never 1 in the same row, typically one factor's dummies.
+
+    `columns` are their positions in the design matrix. `codes[i]` is the
+    position within `columns` of the column row `i` has its 1 in, or
+    `len(columns)` when it has none (the reference level).
+    """
+
+    columns: np.ndarray
+    codes: np.ndarray
+
+    @property
+    def n_levels(self) -> int:
+        """Columns in the group; the reference level is not one of them."""
+        return int(self.columns.size)
+
+
+@dataclass(frozen=True)
+class StructuredDesign:
+    """A design matrix as its dense columns plus groups of indicator columns.
+
+    `dense` are the positions of the columns in no group, the intercept among
+    them, and `X_dense` is `X[:, dense]`, C-contiguous. Built by
+    `structured_design`; the IRLS in `glm.irls` uses it to form the weighted
+    normal equations without the `(n, p^2)` array of per-row outer products.
+    """
+
+    n: int
+    p: int
+    dense: np.ndarray
+    X_dense: np.ndarray
+    groups: tuple[IndicatorGroup, ...]
+    # Every group's `codes` as the rows of one `(n_groups, n)` array, and each
+    # group's `n_levels`: the layout the compiled per-level sums read.
+    codes_matrix: np.ndarray
+    levels: np.ndarray
+
+    def to_matrix(self) -> np.ndarray:
+        """The `(n, p)` design matrix this was built from."""
+        X = np.zeros((self.n, self.p))
+        X[:, self.dense] = self.X_dense
+        for g in self.groups:
+            rows = g.codes < g.n_levels
+            X[np.flatnonzero(rows), g.columns[g.codes[rows]]] = 1.0
+        return X
+
+
+def structured_design(X: np.ndarray) -> StructuredDesign:
+    """Split `X` into dense columns and groups of mutually exclusive 0/1 columns.
+
+    A column is an indicator when every entry is exactly 0 or 1 and it is
+    neither all 0 nor all 1. Indicators are grouped greedily, left to right:
+    each joins the first group none of whose columns is 1 in a row where it
+    is 1, or starts a new one. A factor's dummies with a reference level held
+    out form one group, and factors whose dummies share rows form separate
+    groups; a column of a partially crossed factor can join another factor's
+    group, which changes only how many pair tables there are. Every other
+    column, the intercept among them, is dense.
+
+    The split is a property of `X` alone and changes no fitted value in exact
+    arithmetic: the normal equations are the same sums, accumulated in another
+    order. See docs/design.md, "Indicator columns in the IRLS".
+    """
+    X = np.ascontiguousarray(X, dtype=float)
+    if X.ndim != 2:
+        raise ValueError(f"X must be 2-D, got shape {X.shape}")
+    n, p = X.shape
+    dense: list[int] = []
+    members: list[list[int]] = []
+    masks: list[list[np.ndarray]] = []
+    occupied: list[np.ndarray] = []
+    for j in range(p):
+        col = X[:, j]
+        ones = col == 1.0
+        n_ones = int(np.count_nonzero(ones))
+        if not (0 < n_ones < n) or not bool(np.all(ones | (col == 0.0))):
+            dense.append(j)
+            continue
+        for g, occ in enumerate(occupied):
+            if not np.any(occ & ones):
+                members[g].append(j)
+                masks[g].append(ones)
+                occ |= ones
+                break
+        else:
+            members.append([j])
+            masks.append([ones])
+            occupied.append(ones.copy())
+    codes_matrix = np.empty((len(members), n), dtype=np.int64)
+    groups = []
+    for g, (cols, group_masks) in enumerate(zip(members, masks, strict=True)):
+        codes = codes_matrix[g]
+        codes[:] = len(cols)
+        for level, ones in enumerate(group_masks):
+            codes[ones] = level
+        groups.append(IndicatorGroup(columns=np.asarray(cols, dtype=np.int64), codes=codes))
+    dense_idx = np.asarray(dense, dtype=np.int64)
+    return StructuredDesign(
+        n=n,
+        p=p,
+        dense=dense_idx,
+        X_dense=np.ascontiguousarray(X[:, dense_idx]),
+        groups=tuple(groups),
+        codes_matrix=codes_matrix,
+        levels=np.asarray([len(c) for c in members], dtype=np.int64),
     )

@@ -9,6 +9,14 @@ be.
 This note exists so the next person -- possibly us -- does not have to
 rediscover either the reasoning or the measurements.
 
+**Update:** `glm_solver="structured"` fits targets one at a time, on a
+thread pool. It changes the premises below for a design with many indicator
+columns: each width-1 fit no longer reads the `(n_cells, p^2)` array, so it
+is far cheaper than its share of a batched outer-product fit rather than
+dearer, and the trans background needed the invariance outright. The
+default `"outer"` route still batches, for the reasons here. See
+docs/design.md, "Indicator columns in the IRLS".
+
 ## What the change does
 
 `fit_all_targets` fits a chunk's gRNA targets as one batched logistic IRLS,

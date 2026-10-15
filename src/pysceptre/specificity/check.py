@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 
@@ -10,14 +11,14 @@ import pandas as pd
 
 from .background import (
     DEFAULT_DISTANCE_BINS,
+    _background,
+    _cis_links,
     above_background_by_distance,
-    background_pairs,
     broad_effect_elements,
-    cis_links,
     per_gene_background,
     tested_pairs,
 )
-from .lookup import detour_check, gene_lookup, tss_targets
+from .lookup import _gene_lookup, detour_check, tss_targets
 
 __all__ = ["SpecificityResult", "run_specificity_check"]
 
@@ -84,10 +85,14 @@ def run_specificity_check(
     Args:
         cis_result: the screen's discovery result on element-gene pairs on
             the same chromosome: `grna_target`, `response_id`, `p_value`,
-            `log_2_fold_change`, and `pass_qc` if it has one.
+            `log_2_fold_change` (or `fold_change`, from which it is
+            derived), and `pass_qc` if it has one. Ids may be categorical.
         trans_result: a discovery result, same columns and the same test,
             for the screen's elements against its cis genes on other
-            chromosomes. Pairs outside those sets are ignored.
+            chromosomes. Pairs outside those sets are ignored. A screened
+            result from `run_trans_analysis` is accepted: a row with
+            `screen` "fold_change" or "early_stop" was tested and not
+            resampled, so it counts as a test that is not a call.
         element_positions: `grna_target`, `chrom`, `centre`, for every target
             in `cis_result`. Take these from the screen's own coordinate
             table, never from parsing target names.
@@ -118,24 +123,59 @@ def run_specificity_check(
     Raises:
         KeyError: a column, a target position or a gene position is missing.
         ValueError: `cutoff` is out of range, a cis pair spans two
-            chromosomes, or a gene has two positions.
+            chromosomes, a gene has two positions, or a screened row could
+            be a call at `cutoff` (or, for a TSS target, at `nominal`).
+
+    Warns:
+        UserWarning: some cis genes have no background test. Their
+            background rate counts as 0 in the matched background.
     """
     if not 0.0 < cutoff < 1.0:
         raise ValueError(f"cutoff must lie in (0, 1), got {cutoff!r}")
     rng = np.random.default_rng(seed)
 
-    links = cis_links(
-        cis_result, element_positions, gene_positions, cutoff, control_targets=control_targets
+    cis = tested_pairs(cis_result, "cis_result")
+    links = _cis_links(
+        cis, element_positions, gene_positions, cutoff, control_targets=control_targets
     )
-    background = background_pairs(
-        trans_result,
+    # The one pass over the whole trans result; see docs/design.md, "Specificity check".
+    trans = tested_pairs(trans_result, "trans_result")
+    if measured_genes is None:
+        measured_genes = set(pd.unique(cis["response_id"])) | set(pd.unique(trans["response_id"]))
+    tss = tss_targets(
+        cis["grna_target"].unique(),
+        element_positions,
+        gene_positions,
+        measured_genes,
+        window=tss_window,
+    )
+    trans_tss = trans.loc[trans["grna_target"].isin(set(tss["grna_target"]))]
+    background = _background(
+        trans,
         links,
         element_positions,
         gene_positions,
         cutoff,
         exclude_gene_chroms=exclude_gene_chroms,
     )
+    del trans  # `_background` may have taken it over
+    lookup = _gene_lookup(
+        tss, (("cis_result", cis), ("trans_result", trans_tss)), cutoff, nominal=nominal
+    )
+    del trans_tss
+
     per_gene = per_gene_background(background, genes=np.sort(links["response_id"].unique()))
+    alone = per_gene.loc[per_gene["trans_pairs"] == 0, "response_id"]
+    if len(alone):
+        theirs = links["response_id"].isin(set(alone))
+        warnings.warn(
+            f"{len(alone)} cis gene(s) have no background test, so their background rate "
+            f"counts as 0: {int(theirs.sum())} cis pair(s) and "
+            f"{int(links.loc[theirs, 'link'].sum())} link(s), genes including "
+            f"{alone.tolist()[:5]}. Drop them from cis_result to leave them out of both sides.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     by_distance = above_background_by_distance(
         links, background, distance_bins=distance_bins, n_bootstrap=n_bootstrap, seed=rng
@@ -144,26 +184,14 @@ def run_specificity_check(
         background, element_positions, gene_positions, p_threshold=broad_effect_p
     )
     flagged = set(broad.loc[broad["broad_effect"], "grna_target"])
+    # The flagged elements' background goes with their links; no filtered copy needed.
     by_distance_without = above_background_by_distance(
         links.loc[~links["grna_target"].isin(flagged)],
-        background.loc[~background["grna_target"].isin(flagged)],
+        background,
         distance_bins=distance_bins,
         n_bootstrap=n_bootstrap,
         seed=rng,
     )
-
-    if measured_genes is None:
-        measured_genes = set(tested_pairs(cis_result, "cis_result")["response_id"]) | set(
-            tested_pairs(trans_result, "trans_result")["response_id"]
-        )
-    tss = tss_targets(
-        tested_pairs(cis_result, "cis_result")["grna_target"].unique(),
-        element_positions,
-        gene_positions,
-        measured_genes,
-        window=tss_window,
-    )
-    lookup = gene_lookup(tss, cis_result, trans_result, cutoff, nominal=nominal)
     far = detour_check(links, tss, lookup, far_distance=far_distance)
 
     return SpecificityResult(

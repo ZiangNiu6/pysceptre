@@ -25,6 +25,11 @@ each call does (measured: a 150-column batch over 100k cells went from
 that restriction to this module's own matmuls rather than clobbering BLAS
 threading process-wide (which would also affect any other numpy/scipy work
 happening in the same process outside pysceptre).
+
+A second route, `fit_*_glm_structured`, fits one response on a
+`glm.design.StructuredDesign`, forming the normal equations from the
+design's 0/1 indicator columns by per-level sums instead of from
+`x_outer_flat`. See docs/design.md, "Indicator columns in the IRLS".
 """
 
 from __future__ import annotations
@@ -33,6 +38,48 @@ from dataclasses import dataclass
 
 import numpy as np
 from threadpoolctl import ThreadpoolController
+
+from .design import StructuredDesign
+
+try:
+    from numba import njit
+
+    @njit(cache=True, nogil=True)
+    def _indicator_sums_compiled(codes, levels, offsets, wXd, w, wz, pair_g, pair_h, pair_off):
+        """The per-level sums of `_indicator_sums_numpy`, in one pass over the cells.
+
+        Each sum adds the cells in index order, as `np.bincount` does, so the
+        two routes agree bit for bit; the reference level's sums are skipped.
+        """
+        n_groups, n = codes.shape
+        d = wXd.shape[1]
+        total = offsets[n_groups]
+        diag = np.zeros(total)
+        bsum = np.zeros(total)
+        S = np.zeros((d, total))
+        cross = np.zeros(pair_off[pair_g.shape[0]])
+        for i in range(n):
+            wi = w[i]
+            for g in range(n_groups):
+                c = codes[g, i]
+                if c < levels[g]:
+                    o = offsets[g] + c
+                    diag[o] += wi
+                    bsum[o] += wz[i]
+                    for k in range(d):
+                        S[k, o] += wXd[i, k]
+            for q in range(pair_g.shape[0]):
+                g = pair_g[q]
+                h = pair_h[q]
+                ch = codes[h, i]
+                cg = codes[g, i]
+                if cg < levels[g] and ch < levels[h]:
+                    cross[pair_off[q] + cg * levels[h] + ch] += wi
+        return diag, bsum, S, cross
+
+    _HAVE_NUMBA = True
+except ImportError:  # pragma: no cover - exercised only without numba
+    _HAVE_NUMBA = False
 
 _EPS = 1e-8
 _MAXIT = 25
@@ -343,3 +390,220 @@ def fit_binomial_glm_batch(
     """
     with one_blas_thread():
         return _fit_batch(X, Y, "binomial", eps=eps, maxit=maxit, X_outer_flat=X_outer_flat)
+
+
+def warm_compiled_sums() -> None:
+    """Compile the per-level sums now, or load them from numba's cache, if numba is installed.
+
+    A forked worker inherits the compiled function, so calling this before
+    forking spares each worker its own compile or cache load.
+    """
+    if _HAVE_NUMBA:
+        none = np.zeros(0, dtype=np.int64)
+        _indicator_sums_compiled(
+            np.zeros((1, 1), dtype=np.int64),
+            np.ones(1, dtype=np.int64),
+            np.array([0, 1], dtype=np.int64),
+            np.zeros((1, 1)),
+            np.zeros(1),
+            np.zeros(1),
+            none,
+            none,
+            np.zeros(1, dtype=np.int64),
+        )
+
+
+def _indicator_layout(design: StructuredDesign):
+    """Offsets of each group's levels, and the pairs of groups with their table offsets."""
+    levels = design.levels
+    offsets = np.zeros(levels.size + 1, dtype=np.int64)
+    np.cumsum(levels, out=offsets[1:])
+    pairs = [(g, h) for g in range(levels.size) for h in range(g + 1, levels.size)]
+    pair_g = np.asarray([g for g, _ in pairs], dtype=np.int64)
+    pair_h = np.asarray([h for _, h in pairs], dtype=np.int64)
+    pair_off = np.zeros(len(pairs) + 1, dtype=np.int64)
+    np.cumsum([levels[g] * levels[h] for g, h in pairs], out=pair_off[1:])
+    return offsets, pair_g, pair_h, pair_off
+
+
+def _indicator_sums_numpy(design, offsets, wXd, w, wz, pair_g, pair_h, pair_off):
+    """Per-level sums of `w`, `wz` and each column of `wXd`, and each pair of groups'
+    table of `w`, by `np.bincount`; the layout `_indicator_sums_compiled` returns."""
+    total = int(offsets[-1])
+    diag = np.zeros(total)
+    bsum = np.zeros(total)
+    S = np.zeros((wXd.shape[1], total))
+    for g, group in enumerate(design.groups):
+        L, codes, o = group.n_levels, group.codes, int(offsets[g])
+        diag[o : o + L] = np.bincount(codes, weights=w, minlength=L + 1)[:L]
+        bsum[o : o + L] = np.bincount(codes, weights=wz, minlength=L + 1)[:L]
+        for k in range(wXd.shape[1]):
+            S[k, o : o + L] = np.bincount(codes, weights=wXd[:, k], minlength=L + 1)[:L]
+    cross = np.zeros(int(pair_off[-1]))
+    for q in range(pair_g.size):
+        g, h = design.groups[pair_g[q]], design.groups[pair_h[q]]
+        Lg, Lh = g.n_levels, h.n_levels
+        table = np.bincount(
+            g.codes * (Lh + 1) + h.codes, weights=w, minlength=(Lg + 1) * (Lh + 1)
+        ).reshape(Lg + 1, Lh + 1)[:Lg, :Lh]
+        cross[pair_off[q] : pair_off[q + 1]] = table.ravel()
+    return diag, bsum, S, cross
+
+
+def structured_normal_equations(
+    design: StructuredDesign, w: np.ndarray, wz: np.ndarray, *, compiled: bool | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """`(X^T diag(w) X, X^T wz)` for a `StructuredDesign`, in the design's column order.
+
+    The dense block is two BLAS products; every block that touches an
+    indicator group is a sequential per-level sum: the cross products with
+    the dense columns, the group's diagonal, and the table of each pair of
+    groups. That is `O(n * (d^2 + G*d + G^2))` work for `d` dense columns and
+    `G` groups, against `O(n * p^2)` for the full products, and no `(n, p^2)`
+    array. Equal to `X.T @ (w[:, None] * X)`
+    and `X.T @ wz` in exact arithmetic, not bit for bit.
+
+    `compiled` picks the one-pass numba kernel (the default when numba is
+    installed) or `np.bincount`; both add every sum's terms in cell order, so
+    they agree bit for bit. See docs/design.md, "Indicator columns in the IRLS".
+    """
+    p = design.p
+    A = np.zeros((p, p))
+    b = np.zeros(p)
+    D = design.dense
+    wXd = design.X_dense * w[:, None]
+    if D.size:
+        A[np.ix_(D, D)] = design.X_dense.T @ wXd
+        b[D] = design.X_dense.T @ wz
+    if not design.groups:
+        return A, b
+    offsets, pair_g, pair_h, pair_off = _indicator_layout(design)
+    use_compiled = _HAVE_NUMBA if compiled is None else compiled
+    if use_compiled and not _HAVE_NUMBA:
+        raise RuntimeError("compiled=True needs numba")
+    sums = _indicator_sums_compiled if use_compiled else None
+    if sums is not None:
+        diag, bsum, S, cross = sums(
+            design.codes_matrix, design.levels, offsets, wXd, w, wz, pair_g, pair_h, pair_off
+        )
+    else:
+        diag, bsum, S, cross = _indicator_sums_numpy(
+            design, offsets, wXd, w, wz, pair_g, pair_h, pair_off
+        )
+    for g, group in enumerate(design.groups):
+        cols, sl = group.columns, slice(int(offsets[g]), int(offsets[g + 1]))
+        A[cols, cols] = diag[sl]
+        b[cols] = bsum[sl]
+        if D.size:
+            A[np.ix_(D, cols)] = S[:, sl]
+            A[np.ix_(cols, D)] = S[:, sl].T
+    for q in range(pair_g.size):
+        g, h = design.groups[pair_g[q]], design.groups[pair_h[q]]
+        table = cross[pair_off[q] : pair_off[q + 1]].reshape(g.n_levels, h.n_levels)
+        A[np.ix_(g.columns, h.columns)] = table
+        A[np.ix_(h.columns, g.columns)] = table.T
+    return A, b
+
+
+def structured_linear_predictor(design: StructuredDesign, beta: np.ndarray) -> np.ndarray:
+    """`X @ beta` for a `StructuredDesign`: the dense columns' product plus each group's level."""
+    eta = design.X_dense @ beta[design.dense] if design.dense.size else np.zeros(design.n)
+    for g in design.groups:
+        eta += np.append(beta[g.columns], 0.0)[g.codes]
+    return eta
+
+
+def _fit_structured(
+    design: StructuredDesign,
+    y: np.ndarray,
+    family: str,
+    *,
+    eps: float,
+    maxit: int,
+    mu_floor: float,
+) -> GlmFitBatchResult:
+    """`_fit_batch` for one response, with the normal equations of a `StructuredDesign`.
+
+    The same IRLS step for step: the same starting point, weights, working
+    response, deviance and stopping rule, and the same floor on the mean.
+    Only `X^T W X`, `X^T W z` and `X beta` are formed differently.
+    """
+    y = np.asarray(y, dtype=float)
+    if y.shape != (design.n,):
+        raise ValueError(f"the design has {design.n} rows but y has shape {y.shape}")
+    if family == "poisson":
+        mu = y + 0.1
+        eta = np.log(mu)
+        saturated = None
+    elif family == "binomial":
+        # Started at the marginal rate, as `_fit_batch` starts.
+        rate = float(np.clip(y.mean(), _MU_FLOOR, 1.0 - _MU_FLOOR))
+        mu = np.full(design.n, rate)
+        eta = np.log(mu / (1 - mu))
+        saturated = float(_binomial_saturated(y[None, :])[0])
+    else:
+        raise ValueError(f"unsupported family: {family}")
+
+    dev_old = np.inf
+    converged = False
+    n_iter = 0
+    beta = np.zeros(design.p)
+    for it in range(1, maxit + 1):
+        if family == "poisson":
+            dmu_deta = mu
+            var = mu
+        else:
+            dmu_deta = mu * (1 - mu)
+            var = dmu_deta
+        w = (dmu_deta**2) / var
+        z = eta + (y - mu) / dmu_deta
+        A, b = structured_normal_equations(design, w, w * z)
+        beta = np.linalg.solve(A, b)
+        eta = structured_linear_predictor(design, beta)
+        if family == "poisson":
+            mu = np.clip(np.exp(eta), mu_floor, None)
+            dev_new = float(_poisson_deviance(y, mu))
+        else:
+            mu = np.clip(1.0 / (1.0 + np.exp(-eta)), _MU_FLOOR, 1 - _MU_FLOOR)
+            dev_new = float(_binomial_deviance_from_eta(y, mu, eta, saturated))
+        n_iter = it
+        converged = abs(dev_new - dev_old) / (abs(dev_new) + 0.1) < eps
+        dev_old = dev_new
+        if converged:
+            break
+    return GlmFitBatchResult(
+        coefs=beta, fitted_values=mu, deviance=dev_old, n_iter=n_iter, converged=converged
+    )
+
+
+def fit_poisson_glm_structured(
+    design: StructuredDesign,
+    y: np.ndarray,
+    *,
+    eps: float = _EPS,
+    maxit: int = _MAXIT,
+    mu_floor: float = _MU_FLOOR,
+) -> GlmFitBatchResult:
+    """One Poisson GLM by IRLS on a `StructuredDesign`; the result of `fit_poisson_glm_batch`
+    for a single response, up to floating-point summation order.
+
+    `y`: `(n,)` counts. Returns a `GlmFitBatchResult` with `coefs` `(p,)` and
+    `fitted_values` `(n,)`. See docs/design.md, "Indicator columns in the IRLS".
+    """
+    with one_blas_thread():
+        return _fit_structured(design, y, "poisson", eps=eps, maxit=maxit, mu_floor=mu_floor)
+
+
+def fit_binomial_glm_structured(
+    design: StructuredDesign,
+    y: np.ndarray,
+    *,
+    eps: float = _EPS,
+    maxit: int = _MAXIT,
+) -> GlmFitBatchResult:
+    """One logistic GLM by IRLS on a `StructuredDesign`; the result of
+    `fit_binomial_glm_batch` for a single 0/1 response, up to floating-point
+    summation order. See docs/design.md, "Indicator columns in the IRLS".
+    """
+    with one_blas_thread():
+        return _fit_structured(design, y, "binomial", eps=eps, maxit=maxit, mu_floor=_MU_FLOOR)

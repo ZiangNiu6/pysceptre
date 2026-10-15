@@ -28,6 +28,7 @@ from .pipeline.api import (
     run_calibration_check,
     run_discovery_analysis,
     run_power_check,
+    run_trans_analysis,
 )
 from .specificity import run_specificity_check
 
@@ -48,5 +49,6 @@ __all__ = [
     "run_calibration_check",
     "run_power_check",
     "run_specificity_check",
+    "run_trans_analysis",
     "__version__",
 ]

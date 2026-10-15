@@ -9,12 +9,12 @@ E also lowers some G whose TSS knockdown lowers H. See `docs/design.md`,
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Collection, Iterable
 
 import numpy as np
 import pandas as pd
 
-from .background import called_down, element_table, tested_pairs
+from .background import _refuse_unsafe_screens, _tested, called_down, element_table
 
 __all__ = ["DETOUR_STATUSES", "detour_check", "gene_lookup", "tss_targets"]
 
@@ -75,19 +75,54 @@ def gene_lookup(
     """What each TSS knockdown lowers: gene G knocked down -> gene H.
 
     Every tested pair of a TSS target, from either result, against any gene
-    other than its own. Several TSS targets of one gene are pooled.
+    other than its own. Several TSS targets of one gene are pooled. A
+    screened row of a screened trans result counts as tested, not lowering.
 
     Returns:
         `knocked_down`, `gene`, `tested`, `lowers` (called at `cutoff` with a
         negative effect by any of G's TSS targets), `lowers_nominal` (the same
         at `p < nominal`) and `best_lfc` (the most negative log2 fold change).
+
+    Raises:
+        ValueError: a screened row of a TSS target with a negative effect
+            could lower at `cutoff` or at `nominal`: screened on its fold
+            change, or stopped early with a `p_value_floor` that is missing,
+            not above `cutoff` or below `nominal`.
     """
-    both = pd.concat(
-        [tested_pairs(cis_result, "cis_result"), tested_pairs(trans_result, "trans_result")],
-        ignore_index=True,
+    targets = set(tss["grna_target"])
+    return _gene_lookup(
+        tss,
+        (
+            ("cis_result", _tested(cis_result, "cis_result", targets)),
+            ("trans_result", _tested(trans_result, "trans_result", targets)),
+        ),
+        cutoff,
+        nominal=nominal,
     )
-    both = both.merge(tss[["grna_target", "tss_gene"]], on="grna_target")
-    both = both.loc[both["response_id"] != both["tss_gene"]]
+
+
+def _gene_lookup(
+    tss: pd.DataFrame,
+    tested: Iterable[tuple[str, pd.DataFrame]],
+    cutoff: float,
+    *,
+    nominal: float = 0.05,
+) -> pd.DataFrame:
+    """`gene_lookup` from `(name, tested_pairs(result))` pieces.
+
+    Only the rows of `tss` targets are read, so a caller may pass a piece
+    already restricted to them.
+    """
+    keys = tss[["grna_target", "tss_gene"]]
+    parts = []
+    for name, pairs in tested:
+        rows = pairs.merge(keys, on="grna_target")
+        rows = rows.loc[rows["response_id"] != rows["tss_gene"]]
+        _refuse_unsafe_screens(rows, f"{name} (TSS targets)", cutoff, nominal=nominal)
+        parts.append(
+            rows[["grna_target", "response_id", "p_value", "log_2_fold_change", "tss_gene"]]
+        )
+    both = pd.concat(parts, ignore_index=True)
     both = both.assign(
         lowers=called_down(both, cutoff),
         lowers_nominal=(both["p_value"].to_numpy() < nominal)
