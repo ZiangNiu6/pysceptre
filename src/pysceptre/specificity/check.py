@@ -87,6 +87,7 @@ def run_specificity_check(
             the same chromosome: `grna_target`, `response_id`, `p_value`,
             `log_2_fold_change` (or `fold_change`, from which it is
             derived), and `pass_qc` if it has one. Ids may be categorical.
+            A screened result is accepted as for `trans_result`.
         trans_result: a discovery result, same columns and the same test,
             for the screen's elements against its cis genes on other
             chromosomes. Pairs outside those sets are ignored. A screened
@@ -138,7 +139,8 @@ def run_specificity_check(
     links = _cis_links(
         cis, element_positions, gene_positions, cutoff, control_targets=control_targets
     )
-    # The one pass over the whole trans result; see docs/design.md, "Specificity check".
+    # The one pass over the whole trans result; see docs/design.md,
+    # "The background in one pass".
     trans = tested_pairs(trans_result, "trans_result")
     if measured_genes is None:
         measured_genes = set(pd.unique(cis["response_id"])) | set(pd.unique(trans["response_id"]))

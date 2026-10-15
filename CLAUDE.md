@@ -40,7 +40,11 @@ taken from tests across chromosomes. It is ported from WattEG-paper's
 `analysis/direct_indirect.py`, and `test_specificity_days.py` reproduces that
 notebook on three screens; nothing outside it validates the method. The
 notebook's fingerprint check is deliberately left out. `docs/design.md`,
-"Specificity check", has the rest.
+"Specificity check", has the rest. Its background on a real screen comes
+from `run_trans_analysis` (`pipeline/trans.py`), which tests the trans pairs
+with a reference discovery run's own test; it is checked against
+`run_discovery_analysis` only, and needs numba. `docs/design.md`, "The trans
+background".
 
 `assignment/` is a **sixth**, and most of it is sceptre's.
 `assign_grnas_mixture`, `assign_grnas_thresholding` and `assign_grnas_maximum`
@@ -288,15 +292,34 @@ Python 3.10+ (`requires-python`). Verified passing on 3.10, 3.11, 3.12, 3.13.
   Any measurement of this optimization must name the BLAS it was taken on.
 
 - **`glm_solver` defaults to `"outer"` on purpose.** `"structured"` fits the
-  same GLM to different last bits, so making it the default would move every
-  0.5.0 result. A reference run, its gene cache and its trans runs must share
-  one solver; the cache fingerprint records it. docs/design.md, "Indicator
-  columns in the IRLS".
+  same GLM to different bits -- rounding the IRLS amplifies, not a few ulps --
+  so making it the default would move every 0.5.0 result. A reference run,
+  its gene cache and its trans runs must share one solver; the cache
+  fingerprint records it. It is complement-only in all three analyses, the
+  NT-cells calibration check included, although that check runs the
+  complement engine. docs/design.md, "Indicator columns in the IRLS".
 
-- **numba is optional and both code paths must keep working.**
-  `crt/sampler.py` try/excepts the import and falls back to a pure-numpy
-  `argsort` grouping. The jitted path is a counting sort -- the grouping step
-  was the dominant cost of the module at real scale.
+- **The covariate matrix's memory layout moves bits.** BLAS rounds a
+  row-major and a column-major matrix differently, and the engine uses the
+  layout it is given, and does not pin it. So the gene-fit cache fingerprint
+  records the layout and refuses another (a cache file without it is
+  refused, to be refit), `run_trans_analysis` checks a `GeneFitCache`
+  against its data, layout included, and its `glm_solver` (not the numeric
+  environment: only `load_gene_cache` checks that), and
+  `scripts/sceptre_io.load_h5mu` returns the covariates row-major whatever
+  the file. A plain dict of fits, or none, is not checked, so such a caller
+  must pass the reference run's layout itself. Don't drop that
+  `np.ascontiguousarray`, and don't normalize the layout inside the engine:
+  either moves the last bits of existing results. docs/design.md, "Bits
+  depend on the machine".
+
+- **numba is optional and both code paths must keep working**, with one
+  exception. `crt/sampler.py` try/excepts the import and falls back to a
+  pure-numpy `argsort` grouping. The jitted path is a counting sort -- the
+  grouping step was the dominant cost of the module at real scale. The
+  fallback lists a resample's cells in another order, so a CRT result can
+  differ in its last bits; that is why `run_trans_analysis`, which must
+  reproduce a reference run bit for bit, raises `RuntimeError` without numba.
 
 - **`crt_index_sampler_fast` places cells with replacement and does not
   deduplicate**, an intentional approximation of R's without-replacement

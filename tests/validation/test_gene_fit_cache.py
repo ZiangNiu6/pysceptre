@@ -3,9 +3,10 @@
 `fit_gene_cache` must return the fits the complement engine computes for
 itself, bit for bit; `save_gene_cache` and `load_gene_cache` must round-trip
 every float bit for bit; and `load_gene_cache` must refuse fits it cannot
-vouch for: other data, other engine settings, a gene in two files, or another
-numeric environment. The environment fingerprint and its key are tested at the
-end. See docs/design.md, "The trans background".
+vouch for: other data, a covariate matrix in another memory layout, other
+engine settings, a gene in two files, or another numeric environment. The
+environment fingerprint and its key are tested at the end. See
+docs/design.md, "The trans background".
 """
 
 from __future__ import annotations
@@ -119,11 +120,13 @@ def _engine_gene_fits(monkeypatch, screen):
     return captured[0], result
 
 
-def _rewrite(src, dst, **changes):
-    """Copy a saved cache with fingerprint entries replaced, as a crafted file would be."""
+def _rewrite(src, dst, drop=(), **changes):
+    """Copy a saved cache with fingerprint entries dropped or replaced, as a crafted file would be."""
     with np.load(src, allow_pickle=False) as z:
         arrays = {k: z[k] for k in z.files}
     fp = json.loads(str(arrays["fingerprint"][()]))
+    for key in drop:
+        del fp[key]
     fp.update(changes)
     arrays["fingerprint"] = np.array(json.dumps(fp))
     with open(dst, "wb") as f:
@@ -173,6 +176,8 @@ def test_the_fingerprint_describes_the_fit(screen):
     assert fp["dfr"] == N_CELLS - cov.shape[1]
     assert fp["batch_width"] == 1
     assert fp["theta_bounds"] == list(discovery._THETA_BOUNDS)
+    assert fp["glm_solver"] == "outer"
+    assert cov.flags.c_contiguous and fp["covariate_layout"] == "C"
     assert set(fp["count_digests"]) == set(TESTED)
     row = resp[genes.index("g7")]
     assert fp["count_digests"]["g7"]["nnz"] == int(np.count_nonzero(row))
@@ -303,6 +308,65 @@ def test_load_refuses_a_changed_covariate_entry(screen, saved):
         load_gene_cache(saved, response_matrix=resp, gene_ids=genes, covariate_matrix=changed)
     with pytest.raises(ValueError, match="covariate_matrix has shape"):
         load_gene_cache(saved, covariate_matrix=cov[:, :2])
+
+
+def test_the_covariate_layout_is_recorded_beside_the_values(screen):
+    resp, genes, cov, _, _ = screen
+    wide = np.column_stack([cov, cov])
+    assert gene_cache._covariate_layout(cov) == "C"
+    assert gene_cache._covariate_layout(np.asfortranarray(cov)) == "F"
+    assert gene_cache._covariate_layout(wide[:, : cov.shape[1]]) == "strided"
+    # One row or one column is both; it is "C".
+    assert gene_cache._covariate_layout(np.asfortranarray(cov[:, :1])) == "C"
+    c = fit_gene_cache(resp, genes, cov, genes=["g0"])
+    f = fit_gene_cache(resp, genes, np.asfortranarray(cov), genes=["g0"])
+    strided = fit_gene_cache(resp, genes, wide[:, : cov.shape[1]], genes=["g0"])
+    assert c.fingerprint["covariate_sha256"] == f.fingerprint["covariate_sha256"]
+    assert c.fingerprint["covariate_sha256"] == strided.fingerprint["covariate_sha256"]
+    assert [x.fingerprint["covariate_layout"] for x in (c, f, strided)] == ["C", "F", "strided"]
+
+
+def test_load_refuses_another_covariate_layout(screen, saved, tmp_path):
+    resp, genes, cov, _, _ = screen
+    for other, layout in [
+        (np.asfortranarray(cov), "'F'"),
+        (np.column_stack([cov, cov])[:, : cov.shape[1]], "'strided'"),
+    ]:
+        assert np.array_equal(other, cov)
+        with pytest.raises(ValueError, match=f"memory layout {layout}; .* a 'C' one"):
+            load_gene_cache(saved, response_matrix=resp, gene_ids=genes, covariate_matrix=other)
+    # Fits made from a column-major matrix load only with a column-major one.
+    f_path = tmp_path / "fortran.npz"
+    save_gene_cache(fit_gene_cache(resp, genes, np.asfortranarray(cov), genes=["g1"]), f_path)
+    load_gene_cache(f_path, covariate_matrix=np.asfortranarray(cov))
+    with pytest.raises(ValueError, match="memory layout 'C'; .* a 'F' one"):
+        load_gene_cache(f_path, covariate_matrix=cov)
+    with pytest.raises(ValueError, match="different data or settings: covariate_layout"):
+        load_gene_cache([saved, f_path])
+
+
+def test_load_refuses_a_cache_that_does_not_record_the_layout(saved, tmp_path):
+    crafted = _rewrite(saved, tmp_path / "no_layout.npz", drop=("covariate_layout",))
+    with pytest.raises(ValueError, match="memory layout .* refit them with fit_gene_cache"):
+        load_gene_cache(crafted)
+
+
+def test_the_data_check_refuses_a_fingerprint_it_cannot_use(screen):
+    resp, genes, cov, _, _ = screen
+    fp = fit_gene_cache(resp, genes, cov, genes=["g0"]).fingerprint
+    partial = {k: v for k, v in fp.items() if k not in ("covariate_layout", "count_digests")}
+    with pytest.raises(ValueError, match=r"lacks \['covariate_layout'\]"):
+        gene_cache._check_data(partial, covariate_matrix=cov)
+    with pytest.raises(ValueError, match=r"lacks \['count_digests'\]"):
+        gene_cache._check_data(partial, response_matrix=resp, gene_ids=genes)
+    with pytest.raises(ValueError, match="give both or neither"):
+        gene_cache._check_data(fp, response_matrix=resp)
+    # Only the genes asked about are checked.
+    changed = resp.copy()
+    changed[genes.index("g0"), 0] += 1
+    gene_cache._check_data(fp, response_matrix=changed, gene_ids=genes, genes=[])
+    with pytest.raises(ValueError, match=r"counts of 1 cached gene\(s\) differ"):
+        gene_cache._check_data(fp, response_matrix=changed, gene_ids=genes)
 
 
 def test_load_refuses_a_changed_count(screen, saved):

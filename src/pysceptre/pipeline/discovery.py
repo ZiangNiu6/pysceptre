@@ -23,6 +23,7 @@ MOI and the NT-cells control group".
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import hashlib
 import itertools
@@ -947,8 +948,9 @@ def _resolve_target_chunk_size(
         f"within chunk_memory_gb={chunk_memory_gb}: each target needs about "
         f"{_format_bytes(per_target)} "
         f"({fit_clause}{_format_bytes(draw_part)} of resamples for "
-        f"B1+B2+B3 = {B_total:,}). Chunk size affects only peak memory and "
-        f"batching width, not results."
+        f"B1+B2+B3 = {B_total:,}). Chunk size affects peak memory and batching "
+        f"width; under glm_solver='outer' the batching width can also move the "
+        f"last bits of a target's fit."
     )
     if fitted == 1:
         message += (
@@ -1256,6 +1258,35 @@ def _map_jobs(fn, jobs: list, n_jobs: int, backend: str | None = None):
 # so two analyses in one process run one after the other rather than interleave.
 _ENGINE_LOCK = threading.RLock()
 
+_BLAS_HOLD_LOCK = threading.Lock()
+_BLAS_HOLDERS = 0
+_BLAS_HOLD: contextlib.ExitStack | None = None
+
+
+@contextlib.contextmanager
+def _engine_blas_limit():
+    """One BLAS thread while any analysis is inside, whatever order they leave in.
+
+    The first to enter sets the limit and the last to leave restores what the
+    first found, so unlike `one_blas_thread` it can be left out of order, as
+    interleaved `iter_trans_analysis` generators leave it.
+    """
+    global _BLAS_HOLDERS, _BLAS_HOLD
+    with _BLAS_HOLD_LOCK:
+        if _BLAS_HOLDERS == 0:
+            hold = contextlib.ExitStack()
+            hold.enter_context(one_blas_thread())
+            _BLAS_HOLD = hold
+        _BLAS_HOLDERS += 1
+    try:
+        yield
+    finally:
+        with _BLAS_HOLD_LOCK:
+            _BLAS_HOLDERS -= 1
+            if _BLAS_HOLDERS == 0:
+                hold, _BLAS_HOLD = _BLAS_HOLD, None
+                hold.close()
+
 
 def _one_analysis_at_a_time(engine):
     """Serialize calls to `engine`, under one BLAS-thread limit for the whole call.
@@ -1266,7 +1297,7 @@ def _one_analysis_at_a_time(engine):
 
     @functools.wraps(engine)
     def serialized(*args, **kwargs):
-        with _ENGINE_LOCK, one_blas_thread():
+        with _ENGINE_LOCK, _engine_blas_limit():
             return engine(*args, **kwargs)
 
     return serialized
@@ -1372,7 +1403,8 @@ def run_discovery_ntcells_complement(
         design=design,
         # One gene per BLAS call, so a fit depends on nothing but that gene.
         # See `_GENE_BATCH_WIDTH`. The caller's `chunk_memory_gb` governs
-        # target chunking only, which is result-neutral.
+        # target chunking only, which is result-neutral under
+        # glm_solver="structured" and can move last bits under "outer".
         chunk_memory_gb=_GENE_CHUNK_MEMORY_GB,
         gene_rows=needed_gene_rows,
         batch_width=_GENE_BATCH_WIDTH,

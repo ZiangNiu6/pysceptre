@@ -2,9 +2,12 @@
 
 `iter_trans_analysis` tests (gene, target) pairs exactly as a reference
 discovery run tests them: the same CRT, seed and resampling budget, and every
-target fit in the reference run's own chunk, because the batched logistic fit
-depends on its chunk-mates in the last bits. A pair tested in full gets the
-result `run_discovery_analysis` gives it, bit for bit on the same CPU and BLAS.
+target fit in the reference run's own chunk, because under the default
+`glm_solver="outer"` the batched logistic fit depends on its chunk-mates in
+the last bits (under `"structured"` it does not, and the chunks change
+nothing). A pair tested in full gets the result `run_discovery_analysis`
+gives it, bit for bit on the same CPU class and BLAS, with numba, and with the
+covariate matrix in the same memory layout.
 
 Two screens skip work that no call of the specificity check can see: a pair
 whose fold change is at least 1 is not resampled, and the first stage stops
@@ -17,6 +20,7 @@ background of 1e8 pairs affordable. See docs/design.md, "The trans background".
 from __future__ import annotations
 
 import gc
+import itertools
 import warnings
 from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -27,7 +31,7 @@ import pandas as pd
 
 from ..crt import sampler as _sampler
 from ..glm.design import validate_design_matrix
-from ..glm.irls import one_blas_thread, x_outer_flat
+from ..glm.irls import x_outer_flat
 from ..precompute.pieces import compute_precomputation_pieces
 from ..test_statistic.resampling import run_low_level_test_full, run_low_level_test_screened
 from ..test_statistic.score_stat import FlatDraws, stack_pieces
@@ -38,6 +42,7 @@ from .discovery import (
     GenePrecomputation,
     TargetPrecomputation,
     _design_for,
+    _engine_blas_limit,
     _get_row,
     _map_jobs,
     fit_all_genes,
@@ -46,6 +51,7 @@ from .discovery import (
     resolve_entropy,
     resolve_n_jobs,
 )
+from .gene_cache import _check_data
 
 __all__ = [
     "PAIR_MODES",
@@ -309,8 +315,11 @@ def _gene_fits_for(
 
 
 # Read by `_trans_gene_job` in whichever process or thread runs it; a module
-# global so a forked worker inherits it without copying.
-_TRANS_STATE: dict = {}
+# global so a forked worker inherits it without copying. Keyed by a per-call
+# token, as `discovery._TARGET_STATE` is, so that two generators interleaved
+# in one thread each read their own inputs.
+_TRANS_STATE: dict[int, dict] = {}
+_TRANS_STATE_SEQ = itertools.count()
 
 
 def _new_columns(n: int) -> dict:
@@ -327,10 +336,10 @@ def _n_null_full(stage: float, B2: int, B3: int) -> int:
     return _B1 + (B2 if stage >= 2 else 0) + (B3 if stage == 3 else 0)
 
 
-def _trans_gene_job(job: tuple[str, np.ndarray, np.ndarray, np.ndarray]) -> TransGeneResult:
+def _trans_gene_job(job: tuple[int, str, np.ndarray, np.ndarray, np.ndarray]) -> TransGeneResult:
     """One gene's pairs: its pieces built once, then each pair tested in its mode."""
-    gene_id, rows, target_codes, modes = job
-    st = _TRANS_STATE
+    token, gene_id, rows, target_codes, modes = job
+    st = _TRANS_STATE[token]
     gene = st["gene_fits"][gene_id]
     y = _get_row(st["response_matrix"], st["gene_row_index"][gene_id])
     pieces = compute_precomputation_pieces(y, st["covariate_matrix"], gene.fitted_coefs, gene.theta)
@@ -408,6 +417,13 @@ def iter_trans_analysis(
 ) -> Iterator[TransGeneResult]:
     """Test `pairs` with a reference run's test, yielding one `TransGeneResult` per gene.
 
+    From the first `next()` until it is exhausted or closed, the generator
+    holds the engine lock, so an analysis started in another thread waits for
+    it, and the process-wide limit of one BLAS thread. Generators interleaved
+    in one thread keep their own inputs and may finish in any order; the
+    BLAS limit goes back to what it was before the first of them started
+    only when the last one finishes.
+
     Args:
         response_matrix, gene_ids, covariate_matrix, grna_target_cells: as for
             `run_discovery_analysis`, and the same objects the reference run
@@ -429,16 +445,23 @@ def iter_trans_analysis(
             targets of a chosen chunk are fit, tested or not.
         gene_fits: width-1 gene fits to reuse (a `GeneFitCache` or a dict of
             `GenePrecomputation`); genes it lacks are fit here, with a warning.
+            A `GeneFitCache` is checked against this call's data as
+            `load_gene_cache` checks it: the covariate matrix's shape, values
+            and memory layout, the cell count, `glm_solver`, and the counts of
+            every gene of `pairs` it supplies. A plain dict is not checked.
         p_exact_below: the first stage stops only once a pair's p-value is
             known to be at least this, and above the escalation threshold.
-        block_rows: rows of first-stage resamples evaluated between stop checks.
+        block_rows: rows of first-stage resamples evaluated between stop
+            checks. It decides where a pair can stop early, so whether it is
+            screened "early_stop" and its `p_value_floor` and
+            `n_null_evaluated`; a pair that is not screened gets the full
+            test's result whatever its value.
         n_jobs, backend: workers for the per-gene tests and their backend
             ("fork" or "thread"; the platform default when None). Neither can
             change a result.
         fit_concurrency: target chunks fit at once.
         glm_solver: the reference run's `glm_solver` (see
-            `run_discovery_analysis`). A `GeneFitCache` made with another is
-            refused; a plain dict of fits is not checked.
+            `run_discovery_analysis`).
 
     Yields:
         One `TransGeneResult` per gene of `pairs`, in `gene_ids` order. A pair
@@ -449,7 +472,8 @@ def iter_trans_analysis(
 
     Raises:
         ValueError: a setting that cannot reproduce the reference run, a pair
-            outside the reference chunks, or an unknown gene or mode.
+            outside the reference chunks, an unknown gene or mode, or a
+            `GeneFitCache` that does not match the data or `glm_solver`.
         RuntimeError: numba is not available.
     """
     covariate_matrix, grna_target_cells = _validated(
@@ -498,12 +522,16 @@ def iter_trans_analysis(
     B2, B3 = _SKEW_NORMAL_B2, 0
 
     design = _design_for(glm_solver, covariate_matrix)
-    cached_solver = getattr(gene_fits, "fingerprint", {}).get("glm_solver", "outer")
-    if gene_fits is not None and hasattr(gene_fits, "fingerprint") and cached_solver != glm_solver:
-        raise ValueError(
-            f"gene_fits were made with glm_solver={cached_solver!r}, not {glm_solver!r}"
+    if hasattr(gene_fits, "fingerprint"):
+        _check_data(
+            gene_fits.fingerprint,
+            response_matrix=response_matrix,
+            gene_ids=gene_ids,
+            covariate_matrix=covariate_matrix,
+            glm_solver=glm_solver,
+            genes=[g for g in genes if g in gene_fits.fits],
         )
-    with _ENGINE_LOCK, one_blas_thread():
+    with _ENGINE_LOCK, _engine_blas_limit():
         xo = None if design is not None else x_outer_flat(covariate_matrix)
         fits = _gene_fits_for(
             genes, gene_fits, response_matrix, gene_ids, covariate_matrix, xo, design, n_jobs
@@ -526,10 +554,12 @@ def iter_trans_analysis(
         del xo
         gc.collect()
 
+        token = next(_TRANS_STATE_SEQ)
         jobs = [
-            (gene, rows, codes[rows], modes[rows]) for gene, rows in zip(genes, groups, strict=True)
+            (token, gene, rows, codes[rows], modes[rows])
+            for gene, rows in zip(genes, groups, strict=True)
         ]
-        _TRANS_STATE.update(
+        _TRANS_STATE[token] = dict(
             response_matrix=response_matrix,
             covariate_matrix=covariate_matrix,
             gene_fits=fits,
@@ -545,7 +575,7 @@ def iter_trans_analysis(
         try:
             yield from _map_jobs(_trans_gene_job, jobs, n_jobs, backend=backend)
         finally:
-            _TRANS_STATE.clear()
+            _TRANS_STATE.pop(token, None)
 
 
 def trans_results_frame(pairs: pd.DataFrame, results: Iterable[TransGeneResult]) -> pd.DataFrame:

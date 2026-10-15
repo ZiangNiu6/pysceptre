@@ -268,7 +268,8 @@ def run_discovery_analysis(
         memory -- the input, retained state and allocator overhead sit outside
         it. You should not normally need to change this; the default is the
         fastest and leanest setting measured. Reductions to
-        `target_chunk_size` are warned about and do not change results.
+        `target_chunk_size` are warned about; like any chunk width, they can
+        change a result only under `"outer"`, as above.
     grna_target_weights: `{target: weights}`, aligned with `grna_target_cells`, runs the dose
         test instead of sceptre's: each treated cell enters the score statistic with its weight
         in place of 1 (`dose_weights` builds both dicts from gRNA counts). Weights must be
@@ -310,6 +311,16 @@ def run_discovery_analysis(
         grna_target_weights=grna_target_weights,
         glm_solver=glm_solver,
     )
+
+
+def _check_glm_solver(glm_solver: str, against_nt_cells: bool) -> None:
+    """Refuse an unknown `glm_solver`, and any but `"outer"` against the NT cells."""
+    if glm_solver not in GLM_SOLVERS:
+        raise ValueError(f"glm_solver must be one of {GLM_SOLVERS}, got {glm_solver!r}")
+    if against_nt_cells and glm_solver != "outer":
+        raise ValueError(
+            f"glm_solver={glm_solver!r} is available with the complement control group only"
+        )
 
 
 def _run_discovery(
@@ -444,8 +455,7 @@ def _run_discovery(
             "the dose test (grna_target_weights) runs with the complement control group, the CRT "
             "and grna_integration_strategy='union' only"
         )
-    if glm_solver not in GLM_SOLVERS:
-        raise ValueError(f"glm_solver must be one of {GLM_SOLVERS}, got {glm_solver!r}")
+    _check_glm_solver(glm_solver, against_nt_cells=nt_cells is not None)
     if nt_cells is None:
         result = run_discovery_ntcells_complement(
             **engine_args,
@@ -454,10 +464,6 @@ def _run_discovery(
             glm_solver=glm_solver,
         )
     else:
-        if glm_solver != "outer":
-            raise ValueError(
-                f"glm_solver={glm_solver!r} is available with the complement control group only"
-            )
         result = run_discovery_nt_cells(**engine_args, nt_cells=nt_cells)
     if not per_guide:
         return result
@@ -536,7 +542,8 @@ def run_calibration_check(
         dose test instead of sceptre's: a synthetic target's cell takes its largest weight over
         the group's gRNAs (`DoseWeights.ntc_grna_weights`). Complement control group and CRT only,
         as in `run_discovery_analysis`.
-    glm_solver: as in `run_discovery_analysis`.
+    glm_solver: as in `run_discovery_analysis`; with `control_group="nt_cells"`
+        anything but `"outer"` raises ValueError, as it does there.
 
     Returns the same columns as `run_discovery_analysis`.
     """
@@ -547,6 +554,7 @@ def run_calibration_check(
         raise ValueError(
             "the dose test (ntc_grna_weights) runs with the complement control group only"
         )
+    _check_glm_solver(glm_solver, against_nt_cells=control_group == "nt_cells")
     # Checked here, before the NT-cells restriction below gives both matrices the
     # same width and hides a mismatch.
     _validate_covariate_matrix(covariate_matrix, n_cells=response_matrix.shape[1])
@@ -795,7 +803,8 @@ def run_trans_analysis(
     `reference_pairs` and the same data, seed and settings, would test it:
     targets are fit in the reference run's own chunks, so a pair tested in full
     gets the result `run_discovery_analysis` gives it, bit for bit on the same
-    CPU and BLAS. Not from sceptre; see docs/design.md, "The trans background".
+    CPU class and BLAS, with numba, and with the covariate matrix in the same
+    memory layout. Not from sceptre; see docs/design.md, "The trans background".
 
     Two screens skip work the specificity check cannot see, and are exact for
     every table it returns. A pair with `fold_change >= 1` is not resampled
@@ -808,21 +817,37 @@ def run_trans_analysis(
     the `audit_*` columns).
 
     Complement control group, CRT, `skew_normal`, union strategy only; `seed`
-    is required. `expected_fit_chunks` is the reference layout's
-    `(width, count)`, refused when different; `fit_chunk_ids` selects
-    reference chunks for a run split into shards; `gene_fits` reuses width-1
-    gene fits (see `pysceptre.pipeline.gene_cache`). `glm_solver` must be the
-    reference run's (see `run_discovery_analysis`); a `GeneFitCache` made with
-    another is refused, a plain dict of fits is not checked. `n_jobs`,
-    `backend` and `fit_concurrency` (target chunks fit at once) cannot change
-    a result. `iter_trans_analysis` yields the same results one gene at a
-    time, for runs too large to hold as one table.
+    is required, and so is numba. `expected_fit_chunks` is the reference
+    layout's `(width, count)`, refused when different; `fit_chunk_ids` selects
+    reference chunks for a run split into shards. `gene_fits` reuses width-1
+    gene fits (see `pysceptre.pipeline.gene_cache`): a `GeneFitCache` is
+    checked against the data as `load_gene_cache` checks it (the covariate
+    matrix's values and memory layout, the cell count and the counts of every
+    gene it supplies) and must have been made with this `glm_solver`; a plain
+    dict of fits is not checked. `glm_solver` must be the reference run's (see
+    `run_discovery_analysis`).
+
+    `block_rows` is the number of first-stage resamples evaluated between
+    early-stop checks. It decides where a pair can stop early, so whether it
+    is screened "early_stop" and its `p_value_floor` and `n_null_evaluated`;
+    a pair that is not screened gets the full test's result whatever its
+    value. `n_jobs` sets the workers for the per-gene tests and `backend`
+    their kind, `"fork"` (processes) or `"thread"`, the platform default when
+    None; `fit_concurrency` is the number of target chunks fit at once. None
+    of the three can change a result. `iter_trans_analysis` yields the same
+    results one gene at a time, for runs too large to hold as one table.
 
     Returns:
         `response_id`, `grna_target`, `p_value`, `fold_change`,
         `se_fold_change`, `z_orig`, `stage`, `screen`, `p_value_floor`,
         `n_null_evaluated`, and the `audit_*` columns when a pair was audited;
         one row per pair, in `pairs` order.
+
+    Raises:
+        ValueError: a setting that cannot reproduce the reference run, a pair
+            outside the reference chunks, an unknown gene or mode, or a
+            `GeneFitCache` that does not match the data or `glm_solver`.
+        RuntimeError: numba is not available; the trans background needs it.
     """
     from .trans import iter_trans_analysis, trans_results_frame
 

@@ -110,8 +110,8 @@ is not from sceptre and changes no estimand.
 outer products, once per run, and every iteration forms `X^T W X` as one
 matrix-vector product with it: `n * p^2` multiply-adds, and a read of the
 whole array. With a handful of covariates the array is small and the route is
-the right one. A covariate matrix with a batch factor is not a handful. The
-1.55M-cell screen measured here has `p = 69` (an intercept and five continuous covariates, 60
+the right one. A covariate matrix with a batch factor is not a handful. A
+1.55M-cell transcriptome-wide screen measured here has `p = 69` (an intercept and five continuous covariates, 60
 batch dummies and 3 replicate dummies) over 1,554,804 cells, so the array is
 `1,554,804 * 69^2 * 8` bytes, about 59 GB, read once per iteration of every
 gene fit and every target chunk fit. Each byte read feeds one multiply-add, so
@@ -162,11 +162,17 @@ for the logistic), weights, working response, deviance, convergence rule,
 
 In exact arithmetic the two routes compute the same sums, so the same
 iterates and the same MLE. In floating point they add the same terms in
-another order, so `X^T W X` differs in its last bits, and so does everything
-downstream: coefficients, fitted values, `theta`, `z_orig`. Usually that is
-all, since a statistic a few ulps away gives the same resampling counts, and
-so the same p-value and stage. It is not guaranteed, and two places amplify a
-last-bit difference.
+another order, so `X^T W X` differs in its last bits. The difference does
+not stay there. Each iteration solves the normal equations, and a solve can
+multiply a relative error in them by up to their condition number, so
+everything downstream differs by rounding amplified by the design's
+conditioning, not by a few ulps: coefficients, fitted values, `theta`,
+`z_orig`. On the 69-column design measured below, fitted means agreed to
+7.5e-9 relative, tens of millions of ulps, and the targets' fitted
+probabilities to 9.6e-10. That is still far below what the test resolves. A
+statistic that close almost always gives the same resampling counts, and so
+the same p-value and stage. It is not guaranteed, and two places amplify a
+difference further.
 
 **`theta` on a gene close to Poisson.** `estimate_theta` falls back from the
 MLE to the method of moments to the pilot estimate, and for a gene with
@@ -192,7 +198,16 @@ the GIL, and `np.bincount` in `_indicator_sums_numpy`, the route without
 numba. Both add each sum's terms one cell at a time in index order, with
 additions only and no `fastmath`, so they return the same bits, and
 `test_compiled_and_bincount_sums_agree_bit_for_bit` checks it. Whether numba
-is installed therefore never changes a structured result.
+is installed therefore never changes a structured fit.
+
+It can still change a result, through the CRT sampler. Without numba,
+`crt_index_sampler_fast` groups each resample's cells with an unstable
+`argsort` instead of the counting sort, so a resample holds the same cells
+listed in another order, and the sparse product that gives its null
+statistic adds them in that order. The statistics, and through them a
+p-value, can differ in the last bits on either route. That is why
+`run_trans_analysis` refuses to run without numba ("Bits depend on the
+machine").
 
 ### Target fits no longer depend on their chunk-mates
 
@@ -210,17 +225,21 @@ changing a value. Gene fits were already one per call.
 
 0.5.0's results came from the outer route, and a reference run, its gene-fit
 cache and any trans run tested against it must use one route throughout.
-Making `"structured"` the default would change the last bits of every
-existing result with no change to the caller's code. So `"outer"` stays the
-default and leaves every result bit-identical to 0.5.0, and `"structured"` is
-chosen once per analysis: `run_trans_analysis` must be given the reference
-run's, and a `GeneFitCache` records it in its fingerprint (a cache written
-before the option existed counts as `"outer"`) and is refused under the
-other.
+Making `"structured"` the default would change the bits of every existing
+result with no change to the caller's code. So `"outer"` stays the default
+and leaves every result bit-identical to 0.5.0 for the same inputs, and
+`"structured"` is chosen once per analysis: `run_trans_analysis` must be
+given the reference run's, and a `GeneFitCache` records it in its
+fingerprint and is refused under the other. A cache file written before the
+fingerprint recorded the covariate matrix's memory layout ("Bits depend on
+the machine") is refused whatever its route, to be refit.
 
 `"structured"` is offered with the complement control group only. Against
 the NT cells the gene is refit for every pair on that pair's cells, a
-different loop, and nothing there was measured.
+different loop, and nothing there was measured. The calibration check
+against the NT cells runs the complement engine inside the NT pool, so it
+could take either route, but it refuses `"structured"` as discovery and the
+power check do, so that the setting means the same in all three analyses.
 
 ### Measured
 
@@ -1197,6 +1216,28 @@ three screens) and does not grow with the square of the panel.
 background call gets a rate of zero, which is an underestimate rather than a
 measurement. Shrinkage toward the pooled rate is open, and not done.
 
+### The background in one pass
+
+A trans result from `run_trans_analysis` can hold of the order of 1e8 rows
+("The trans background"), so `run_specificity_check` reads it once.
+`tested_pairs` keeps its tested rows, copying them column by column and
+nothing else. The measured genes, the TSS lookup's rows and the background
+are all taken from that one frame. `background_pairs` keeps the rows of the
+cis elements and genes on other chromosomes with one hash lookup per row and
+id column into the link sets, and when it keeps every row the frame becomes
+the background table without a copy.
+
+The bootstrap's per-gene rates come from two elements x genes matrices, the
+background tests and the background calls, each multiplied by every draw's
+element weights. They are built sparse, and one more than half full is
+converted to a dense array and multiplied as one (`_DENSE_ABOVE` in
+`specificity/background.py`). The two products give the same bits. The
+entries count tests or calls and the weights count how often a draw takes
+each element, so every product and every partial sum is an integer, and
+float64 holds every integer below 2**53 exactly: no addition rounds, so the
+order in which the dense and the sparse product add cannot matter. Which one
+runs changes time and memory, never a rate.
+
 ### Broad-effect elements
 
 Some elements lower many genes on other chromosomes, far beyond the
@@ -1279,11 +1320,14 @@ Discovery fits each gene once and each target once, batched per target chunk,
 then rebuilds a gene's pieces (`mu`, `w`, `a`, `D` and the stacked
 `(n_cells, p + 2)` array) once per gene per chunk it meets
 (`_run_target_chunks`). The chunk width comes from `chunk_memory_gb`, which
-charges each target `10 * n_cells * 8` bytes of fit arrays: on a screen of
-1.5M cells the default budget gives chunks of six targets. A cis pair list
-meets each gene in a handful of chunks; a trans list meets every gene in
-every chunk, so the rebuilds, each `O(n_cells * p^2)` work and a few GB of
-fresh memory at that size, grow with genes times chunks and dominate.
+charges each target `10 * n_cells * 8` bytes of fit arrays plus 8 bytes per
+cell index of its resamples, of which it is charged `B1 + B2 + B3` times the
+median treated-cell count over targets (`target_bytes_per_item`): on the
+1,554,804-cell screen above, the default budget gives chunks of six
+targets. A cis pair list meets each gene in a handful of chunks; a trans list
+meets every gene in every chunk, so the rebuilds, each `O(n_cells * p^2)`
+work and a few GB of fresh memory at that size, grow with genes times chunks
+and dominate.
 Dividing a cis run's time by its pair count and multiplying by the trans
 count therefore prices mostly fixed costs.
 
@@ -1291,18 +1335,26 @@ The trans run keeps the fits as they are and changes only the loop: a shard's
 targets are all fit and drawn first, then each gene's pieces are built once
 and tested against every target of the shard. Rebuilds become genes times
 shards. Width-1 gene fits depend on nothing but the gene, so they are
-computed once and reused by every shard (`pipeline/gene_cache.py`), with a
-fingerprint of the data and of the numerical environment that refuses a cache
-made elsewhere.
+computed once and reused by every shard (`pipeline/gene_cache.py`). A cache
+carries a fingerprint of the data, the covariate matrix's memory layout
+included ("Bits depend on the machine"), of the engine settings and of the
+numerical environment. `load_gene_cache` refuses a file made in another
+numerical environment unless given `check_environment=False`, and, when
+given the data, one made from other data. `run_trans_analysis` checks a
+`GeneFitCache` against its own data and `glm_solver` the same way, but not
+against the environment: a cache loaded with `check_environment=False` is
+used in whatever environment it is given to. A plain dict of fits is not
+checked at all.
 
 ### Targets are fit in the reference run's chunks
 
 A target's draws come from its fitted probabilities through
-`rng.binomial(B, p)`, and the batched logistic fit is not bit for bit across
-batch compositions ("Resampling budgets" and `_resolve_target_chunk_size`).
-So the trans run fits every target with exactly the chunk-mates it had in the
-reference run: `reference_fit_chunks` rebuilds the reference layout from the
-reference run's pairs and settings, `run_trans_analysis` refuses a layout of
+`rng.binomial(B, p)`, and under the default `glm_solver="outer"` the batched
+logistic fit is not bit for bit across batch compositions ("Target fits no
+longer depend on their chunk-mates"). So the trans run fits every target with
+exactly the chunk-mates it had in the reference run: `reference_fit_chunks`
+rebuilds the reference layout from the reference run's pairs and settings,
+`run_trans_analysis`, given `expected_fit_chunks`, refuses a layout of
 another width or count, and a shard is a set of whole reference chunks, all
 of whose targets are fit whether or not the shard tests them.
 
@@ -1354,15 +1406,36 @@ effect is screened.
 
 numpy dispatches `exp` and `log` to AVX-512 loops where the CPU has them, and
 scipy's OpenBLAS picks its kernels by CPU model, so the same code gives
-different last bits on different node types. On the 1.55M-cell screen the same
+different last bits on different node types. On the 1,554,804-cell screen the same
 0.5.0 code on an Intel Sapphire Rapids node, with a different target set,
 against the AMD EPYC 7502 run: `z_orig` differed on all 280 shared pairs
 (median 1.9e-11 relative, at most 3.1e-9), `fold_change` on all 280 (at most
 1.7e-11), the p-value on 10 stage-2 pairs (at most 3.8e-10) and the stage on
 none. A trans run that must match its reference bit for bit therefore runs on
-the reference run's CPU class. `scripts/run_trans_background.py` tests every
-reference pair of a shard in full first and stops the shard on any
-difference, so a wrong node type fails in minutes rather than silently.
+the reference run's CPU class.
+
+Two things besides the machine move bits. BLAS rounds a product differently
+for a row-major and a column-major covariate matrix, and the engine uses the
+matrix in the layout it is given, so the two layouts can give one analysis
+different last bits. The engine does not pin the layout: `run_trans_analysis`
+given no gene fits, or a plain dict of them, accepts either. What pins it is
+around the engine. A gene-fit cache records the layout its fits were made
+with and is refused with another, and `scripts/sceptre_io.load_h5mu` returns
+the covariate matrix row-major whatever the file, so the two ways of writing
+a dataset give the same bits; a caller with its own matrix must pass the
+reference run's layout. Without numba, the CRT sampler lists each resample's
+cells in another order ("The compiled and numpy sums agree bit for bit"), so
+`run_trans_analysis` refuses to run without it, and the environment
+fingerprint records whether it is installed.
+
+`scripts/run_trans_background.py` tests a shard's reference pairs in full
+alongside its trans pairs, in gene order, checks each against the reference
+result bit for bit as its gene comes up, and stops the shard on any
+difference, so a wrong node type stops the shard rather than passing
+silently. The parts written before the first difference stay on disk
+with their completion markers, and a restarted shard skips them, so a shard
+stopped this way should be cleared before it is rerun, or those parts keep
+the wrong node's bits.
 
 ### What it does not establish
 

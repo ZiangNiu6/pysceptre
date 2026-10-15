@@ -36,7 +36,7 @@ _SCREENED = ("fold_change", "early_stop")
 # Draws times pairs held at once by the bootstrap; bounds memory, not the answer.
 _BOOTSTRAP_BLOCK = 1 << 22
 # An element x gene matrix denser than this is multiplied as a dense array, with the
-# same bits; see docs/design.md, "Specificity check".
+# same bits; see docs/design.md, "The background in one pass".
 _DENSE_ABOVE = 0.5
 
 
@@ -49,8 +49,8 @@ def _require(frame: pd.DataFrame, name: str, columns: Sequence[str]) -> None:
 def tested_pairs(result: pd.DataFrame, name: str) -> pd.DataFrame:
     """The rows of a discovery result that were tested, in their order.
 
-    A row was tested when its p-value is finite, or when a screened trans
-    result marks it `screen` "fold_change" or "early_stop": tested, not
+    A row was tested when its p-value is finite, or when a screened result
+    marks it `screen` "fold_change" or "early_stop": tested, not
     resampled, so its p-value is NaN. With a `pass_qc` column, that must be
     true as well.
 
@@ -58,8 +58,9 @@ def tested_pairs(result: pd.DataFrame, name: str) -> pd.DataFrame:
         `grna_target` and `response_id` as object dtype, so categorical
         input gives the same frame as object input; `p_value`;
         `log_2_fold_change`, which is `np.log2(fold_change)` when the result
-        has only `fold_change`; then `screen` and `p_value_floor`, each only
-        when the result has it.
+        has only `fold_change`, with a fold change at or below 0 (the dose
+        test can report one) as `-inf` and NaN kept NaN; then `screen` and
+        `p_value_floor`, each only when the result has it.
 
     Raises:
         KeyError: a column is missing, or both `log_2_fold_change` and
@@ -99,8 +100,10 @@ def _tested(
         if out[c].dtype != object:
             out[c] = out[c].astype(object)
     if derive:
+        fc = result["fold_change"].to_numpy(dtype=float)[keep]
+        # At or below 0 is -inf, so the direction of a dose-test fold change is kept.
         with np.errstate(divide="ignore"):
-            lfc = np.log2(result["fold_change"].to_numpy(dtype=float)[keep])
+            lfc = np.log2(np.where(fc <= 0, 0.0, fc))
         out["log_2_fold_change"] = pd.Series(lfc)
     else:
         out["log_2_fold_change"] = kept("log_2_fold_change")
@@ -221,7 +224,8 @@ def cis_links(
         cis_result: a discovery result (`grna_target`, `response_id`,
             `p_value`, `log_2_fold_change` or `fold_change`, optionally
             `pass_qc`) on pairs with the element and the gene on the same
-            chromosome.
+            chromosome. May be a screened result (`screen`,
+            `p_value_floor`): its screened rows are tests that are not links.
         element_positions: `grna_target`, `chrom`, `centre`.
         gene_positions: `response_id`, `chrom`, `tss`.
         cutoff: the nominal p-value threshold the screen was called at.
@@ -229,13 +233,17 @@ def cis_links(
             positive controls. Their pairs are left out.
 
     Returns:
-        `grna_target`, `response_id`, `p_value`, `log_2_fold_change`,
-        `distance` (element centre to TSS) and `link` (called with a negative
-        effect), one row per tested pair.
+        `grna_target`, `response_id`, `p_value`, `log_2_fold_change`, then
+        `screen` and `p_value_floor` when `cis_result` has them, `distance`
+        (element centre to TSS) and `link` (called with a negative effect),
+        one row per tested pair.
 
     Raises:
         KeyError: a target or gene has no position.
-        ValueError: a pair has its element and gene on different chromosomes.
+        ValueError: a pair has its element and gene on different chromosomes,
+            or a screened row of an element with a negative effect could be a
+            link at `cutoff`: screened on its fold change, or stopped early
+            with a `p_value_floor` that is missing or not above `cutoff`.
     """
     return _cis_links(
         tested_pairs(cis_result, "cis_result"),
@@ -256,6 +264,7 @@ def _cis_links(
 ) -> pd.DataFrame:
     """`cis_links` from `tested_pairs(cis_result)`."""
     pairs = pairs.loc[~pairs["grna_target"].isin(set(control_targets))].reset_index(drop=True)
+    _refuse_unsafe_screens(pairs, "cis_result", cutoff)
     elements = element_table(element_positions)
     missing = sorted(set(pairs["grna_target"]) - set(elements.index))
     if missing:
@@ -350,14 +359,21 @@ def _background(
     keep = (ti >= 0) & (gi >= 0)
     present = genes[np.bincount(gi[keep], minlength=len(genes)) > 0]
     positions = gene_table(gene_positions, present)
-    e_chrom = elements["chrom"].reindex(targets).to_numpy()
-    g_chrom = positions["chrom"].reindex(genes).to_numpy()
     if keep.any():
+        e_chrom = elements["chrom"].reindex(targets).to_numpy()
+        g_chrom = positions["chrom"].reindex(genes).to_numpy()
         # Chromosomes as shared codes; a missing one never equals anything, as with `!=`.
         codes = pd.factorize(np.concatenate([e_chrom, g_chrom]))[0]
         e_code, g_code = codes[: len(targets)], codes[len(targets) :]
         g_code[g_code < 0] = -2
-        excluded = np.isin(g_chrom, list(exclude_gene_chroms))
+        # Via pandas: a gene with no position is pd.NA in a nullable dtype, which np.isin
+        # cannot compare.
+        excluded = (
+            positions["chrom"]
+            .isin(list(exclude_gene_chroms))
+            .reindex(genes, fill_value=False)
+            .to_numpy(dtype=bool)
+        )
         keep &= (e_code[ti] != g_code[gi]) & ~excluded[gi]
     if keep.all():
         out = pairs

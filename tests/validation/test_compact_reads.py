@@ -8,6 +8,7 @@ bit.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -200,3 +201,159 @@ def test_the_all_cells_file_is_refused_backed(dataset, in_use_file):
         write_in_use(dataset, in_use_file)
     with pytest.raises(ValueError, match="only cells in use"):
         write_in_use(in_use_file, in_use_file.with_name("again.h5mu"))
+
+
+# --- an nt_cells dataset: the NT-cell pool, gRNA counts and individual guides --
+
+
+def _nt_pool_export(pool_cell_out_of_use: bool = False) -> SceptreExport:
+    """An all-cells nt_cells export whose pool is in R's order: units in dict order, not sorted."""
+    rng = np.random.default_rng(7)
+    n_cells, n_genes = 800, 12
+    X = sparse.random(n_genes, n_cells, density=0.3, format="csr", random_state=7)
+    X.data = np.ceil(X.data * 30)
+    in_use = rng.random(n_cells) > 0.15
+    cells = rng.permutation(np.flatnonzero(in_use))
+    if pool_cell_out_of_use:
+        cells[0] = np.flatnonzero(~in_use)[0]
+    ntc = {"nt_b": np.sort(cells[:120]), "nt_a": np.sort(cells[120:220])}
+    targets = {"t0": np.sort(cells[220:300]), "t1": np.sort(cells[300:390])}
+    guides = {"t0_g1": targets["t0"][::2], "t0_g2": targets["t0"][1::2], "t1_g1": targets["t1"]}
+    counts = sparse.random(5, n_cells, density=0.2, format="csr", random_state=8)
+    counts.data = np.ceil(counts.data * 9)
+    return SceptreExport(
+        response_matrix=X,
+        gene_ids=[f"g{i}" for i in range(n_genes)],
+        covariate_matrix=np.column_stack([np.ones(n_cells), rng.normal(size=n_cells)]),
+        grna_target_cells=targets,
+        pairs=pd.DataFrame({"response_id": ["g0", "g1", "g2"], "grna_target": ["t0", "t0", "t1"]}),
+        metadata={
+            "n_cells": n_cells,
+            "n_genes": n_genes,
+            "n_targets": len(targets),
+            "n_pairs": 3,
+            "n_covariates": 2,
+            "n_nonzero": X.nnz,
+            "covariate_names": ["intercept", "a"],
+            "side_code": 0,
+            "B1": 499,
+            "B2": 4999,
+            "B3": 0,
+            "sceptre_version": "0.10.3",
+            "all_cells": True,
+            "low_moi": True,
+            "control_group": "nt_cells",
+            "resampling_mechanism": "crt",
+        },
+        ntc_grna_cells=ntc,
+        targeting_grna_cells=guides,
+        all_nt_idxs=np.concatenate(list(ntc.values())),
+        in_use=in_use,
+        grna_counts=counts,
+        grna_count_ids=["nt_b", "nt_a", "t0_g1", "t0_g2", "t1_g1"],
+    )
+
+
+def _same_cells(a: dict, b: dict) -> None:
+    assert list(a) == list(b)
+    for unit, cells in b.items():
+        assert a[unit].dtype == cells.dtype and np.array_equal(a[unit], cells), unit
+
+
+@pytest.mark.parametrize("backed", [False, True])
+def test_the_in_use_file_keeps_the_nt_pool(tmp_path, backed):
+    from write_in_use_h5mu import write_in_use
+
+    src = write_h5mu(_nt_pool_export(), tmp_path / "src.h5mu")
+    dst = write_in_use(src, tmp_path / "dst.h5mu")
+    want = load_export(src)
+    got = sceptre_io.load_h5mu(dst, backed=backed)
+    assert want.control_group == got.control_group == "nt_cells" and got.moi == "low"
+    assert want.all_nt_idxs.dtype == got.all_nt_idxs.dtype == np.int64
+    assert np.array_equal(got.all_nt_idxs, want.all_nt_idxs)
+    # R's order, which the sort a remap could slip in would lose.
+    assert not np.all(np.diff(got.all_nt_idxs) > 0)
+    assert np.array_equal(got.all_nt_idxs, np.concatenate(list(got.ntc_grna_cells.values())))
+    _same_cells(got.ntc_grna_cells, want.ntc_grna_cells)
+    _same_cells(got.grna_target_cells, want.grna_target_cells)
+    _same_cells(got.targeting_grna_cells, want.targeting_grna_cells)
+    assert got.grna_count_ids == want.grna_count_ids
+    assert got.grna_counts.dtype == want.grna_counts.dtype
+    assert got.grna_counts.shape == want.grna_counts.shape
+    assert (got.grna_counts != want.grna_counts).nnz == 0
+    assert np.array_equal(got.covariate_matrix, want.covariate_matrix)
+    assert got.metadata["n_cells"] == want.metadata["n_cells"] == got.covariate_matrix.shape[0]
+    assert got.metadata["n_nonzero"] == want.metadata["n_nonzero"]
+
+
+def test_the_in_use_file_keeps_the_global_var(tmp_path):
+    import mudata
+    from write_in_use_h5mu import write_in_use
+
+    md = mudata.read_h5mu(write_h5mu(_nt_pool_export(), tmp_path / "plain.h5mu"))
+    md.var["note"] = [f"v{i}" for i in range(md.n_vars)]
+    md.write_h5mu(tmp_path / "src.h5mu")
+    got = mudata.read_h5mu(write_in_use(tmp_path / "src.h5mu", tmp_path / "dst.h5mu"))
+    assert got.var_names.equals(md.var_names)
+    assert got.var["note"].astype(str).tolist() == md.var["note"].astype(str).tolist()
+
+
+def _never(*args, **kwargs):
+    raise AssertionError("a modality was read into memory before the refusal")
+
+
+def test_a_pool_cell_out_of_use_is_refused(tmp_path, monkeypatch):
+    import anndata
+    from write_in_use_h5mu import write_in_use
+
+    src = write_h5mu(_nt_pool_export(pool_cell_out_of_use=True), tmp_path / "pool.h5mu")
+    monkeypatch.setattr(anndata.AnnData, "to_memory", _never)
+    with pytest.raises(ValueError, match="NT-cell pool all_nt_idxs are not in use"):
+        write_in_use(src, tmp_path / "pool_out.h5mu")
+    assert sorted(f.name for f in tmp_path.iterdir()) == ["pool.h5mu"]
+
+
+_EXTRA = ("uns['cell_ids']", "mod['rna'].uns['note']", "obsm['umap']", "obsp['knn']")
+_EXTRA += ("varm['loadings']", "varp['corr']")
+
+
+@pytest.mark.parametrize("entry", _EXTRA)
+def test_what_cannot_be_renumbered_is_refused(tmp_path, monkeypatch, entry):
+    import anndata
+    import mudata
+    from write_in_use_h5mu import write_in_use
+
+    md = mudata.read_h5mu(write_h5mu(_nt_pool_export(), tmp_path / "plain.h5mu"))
+    n, m = md.n_obs, md.n_vars
+    where, key, value = {
+        "uns['cell_ids']": (md.uns, "cell_ids", np.arange(10)),
+        "mod['rna'].uns['note']": (md.mod["rna"].uns, "note", "x"),
+        "obsm['umap']": (md.obsm, "umap", np.zeros((n, 2))),
+        "obsp['knn']": (md.obsp, "knn", sparse.identity(n, format="csr")),
+        "varm['loadings']": (md.varm, "loadings", np.zeros((m, 2))),
+        "varp['corr']": (md.varp, "corr", sparse.identity(m, format="csr")),
+    }[entry]
+    where[key] = value
+    md.write_h5mu(tmp_path / "extra.h5mu")
+    monkeypatch.setattr(anndata.AnnData, "to_memory", _never)
+    # The entry alone: the plain file holds nothing else that is refused.
+    with pytest.raises(ValueError, match=re.escape(f"holds {entry}, which")):
+        write_in_use(tmp_path / "extra.h5mu", tmp_path / "extra_out.h5mu")
+    assert not (tmp_path / "extra_out.h5mu").exists()
+
+
+# --- run_trans_background.py fit-genes: the reference run's genes, backed or not --
+
+
+def test_fit_genes_takes_the_reference_genes_backed_or_not(dataset, in_use_file):
+    pytest.importorskip("pyarrow", reason="the io extra is not installed")
+    from run_trans_background import _reference_genes
+
+    eager = load_export(dataset)
+    wanted = set(eager.pairs["response_id"])
+    want = [g for g in eager.gene_ids if g in wanted]
+    compact = load_export_compact(dataset, genes="pairs")
+    backed = sceptre_io.load_h5mu(in_use_file, backed=True)
+    # The backed read lists every gene in the file, the compact one only the pairs'.
+    assert backed.gene_ids == eager.gene_ids and compact.gene_ids == want != eager.gene_ids
+    assert _reference_genes(backed) == _reference_genes(compact) == want

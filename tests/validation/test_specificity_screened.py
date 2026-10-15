@@ -5,13 +5,15 @@ tested without resampling, `screen` saying why and `p_value_floor` bounding the
 p-value it skipped. Every table the check returns must be the same as from the
 unscreened result, bit for bit. The rest pins what the check gained to read
 such a result at ~100M rows: one pass over it, categorical ids, `fold_change`
-in place of `log_2_fold_change`, the warning for genes without background
-tests, the cross-chromosome message and the dense bootstrap products.
-Synthetic, fixed seed; no R.
+in place of `log_2_fold_change` (a dose-test fold change at or below 0
+included), the warning for genes without background tests, nullable string
+chromosomes, the cross-chromosome message, a screened cis result and the dense
+bootstrap products. Synthetic, fixed seed; no R.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import re
 import warnings
 
@@ -43,6 +45,7 @@ TABLES = (
     "far_links",
 )
 LOUD = "E7"
+HAS_PYARROW = importlib.util.find_spec("pyarrow") is not None
 
 
 def _screen(seed: int = 0, n_elements: int = 120, n_genes: int = 48, n_chroms: int = 4):
@@ -95,6 +98,22 @@ def _screen(seed: int = 0, n_elements: int = 120, n_genes: int = 48, n_chroms: i
 def _with_lfc(result: pd.DataFrame) -> pd.DataFrame:
     with np.errstate(divide="ignore"):
         return result.assign(log_2_fold_change=np.log2(result["fold_change"]))
+
+
+def _with_dose_lfc(result: pd.DataFrame) -> pd.DataFrame:
+    """`log_2_fold_change` given: `log2` of a positive fold change, -inf at or below 0, NaN kept."""
+    fc = result["fold_change"].to_numpy(dtype=float)
+    lfc = np.full(fc.shape, -np.inf)
+    lfc[np.isnan(fc)] = np.nan
+    lfc[fc > 0] = np.log2(fc[fc > 0])
+    return result.assign(log_2_fold_change=lfc)
+
+
+def _rows(table: pd.DataFrame, pairs: pd.DataFrame) -> pd.DataFrame:
+    """The rows of `table` whose (grna_target, response_id) is in `pairs`."""
+    ids = ["grna_target", "response_id"]
+    wanted = pd.MultiIndex.from_frame(pairs[ids])
+    return table.loc[pd.MultiIndex.from_frame(table[ids]).isin(wanted)]
 
 
 def _screened(trans: pd.DataFrame) -> pd.DataFrame:
@@ -301,6 +320,60 @@ def test_fold_change_stands_in_for_log_2_fold_change():
         background.tested_pairs(trans.drop(columns="fold_change"), "trans_result")
 
 
+def test_a_fold_change_at_or_below_zero_is_a_negative_effect():
+    """The dose test's fold change, `1 + sum t (y - mu) / sum t^2 mu`, can be 0 or below."""
+    frame = pd.DataFrame(
+        {
+            "grna_target": "E0",
+            "response_id": [f"G{k}" for k in range(6)],
+            "p_value": 1e-8,
+            "fold_change": [0.0, -0.00587, -3.0, np.nan, 0.5, 2.0],
+        }
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        got = background.tested_pairs(frame, "trans_result")
+    lfc = got["log_2_fold_change"].to_numpy()
+    assert np.isneginf(lfc[:3]).all()
+    assert np.isnan(lfc[3])
+    assert lfc[4:].tolist() == [-1.0, 1.0]
+    assert background.called_down(got, CUTOFF).tolist() == [True, True, True, False, True, False]
+
+    # Through the whole check: links, background and lookup as with -inf given.
+    cis, trans, elements, genes = _screen(11)
+    rng = np.random.default_rng(11)
+    hits = cis.index[(cis["p_value"] < CUTOFF) & cis["pass_qc"]]
+    knocked = rng.choice(hits, 6, replace=False)
+    cis.loc[knocked, "fold_change"] = [0.0, 0.0, 0.0, -0.00587, -0.00587, -3.0]
+    usable = trans["p_value"].notna() & trans["pass_qc"] & (trans["grna_target"] != LOUD)
+    of_e0 = trans["grna_target"] == "E0"
+    strong = np.concatenate(
+        [
+            trans.index[usable & of_e0][:3],
+            rng.choice(trans.index[usable & ~of_e0], 20, replace=False),
+        ]
+    )
+    trans.loc[strong, "p_value"] = 1e-4
+    trans.loc[strong, "fold_change"] = np.resize([0.0, -0.00587, -3.0], strong.size)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        derived = _check(cis, trans, elements, genes)
+    given = _check(_with_dose_lfc(cis), _with_dose_lfc(trans), elements, genes)
+    _assert_same_tables(derived, given)
+    pd.testing.assert_frame_equal(derived.background, given.background, check_exact=True)
+
+    links = _rows(derived.links, cis.loc[knocked])
+    assert len(links) == 6 and links["link"].all()
+    assert np.isneginf(links["log_2_fold_change"]).all()
+    bg = _rows(derived.background, trans.loc[strong])
+    assert len(bg) == strong.size and bg["background"].all()
+    assert derived.tss_targets.set_index("grna_target").loc["E0", "tss_gene"] == "G0"
+    lookup = derived.gene_lookup.set_index(["knocked_down", "gene"])
+    lowered = lookup.loc[[("G0", h) for h in trans.loc[strong[:3], "response_id"]]]
+    assert lowered["lowers"].all() and np.isneginf(lowered["best_lfc"]).all()
+
+
 def test_genes_without_background_tests_warn_and_count_as_rate_zero():
     cis, trans, elements, genes = _screen(6)
     with warnings.catch_warnings():
@@ -330,6 +403,96 @@ def test_genes_without_background_tests_warn_and_count_as_rate_zero():
     bins = pd.cut(res.links["distance"], [0, 1e3, 1e4, 5e4, 1e5, np.inf], include_lowest=True)
     matched = res.links["response_id"].map(rate).fillna(0).groupby(bins, observed=False).mean()
     np.testing.assert_allclose(res.by_distance["background"], matched.to_numpy(), rtol=1e-12)
+
+
+@pytest.mark.parametrize("exclude", [("chrY",), ("chr3",)], ids=["chrY", "chr3"])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        "string",
+        pytest.param(
+            "string[pyarrow]", marks=pytest.mark.skipif(not HAS_PYARROW, reason="no pyarrow")
+        ),
+    ],
+)
+def test_nullable_string_chromosomes_give_the_object_result(dtype, exclude):
+    """A cis gene without a background test has no chromosome there: pd.NA, not an error."""
+    cis, trans, elements, genes = _screen(0)
+    trans = trans.loc[trans["response_id"] != "G7"]
+    with pytest.warns(UserWarning, match="no background test"):
+        want = _check(cis, trans, elements, genes, exclude_gene_chroms=exclude)
+    for elements_too in (False, True):
+        g = genes.astype({"chrom": dtype})
+        e = elements.astype({"chrom": dtype}) if elements_too else elements
+        with pytest.warns(UserWarning, match="no background test"):
+            got = _check(cis, trans, e, g, exclude_gene_chroms=exclude)
+        _assert_same_tables(want, got)
+        pd.testing.assert_frame_equal(want.background, got.background, check_exact=True)
+
+    per_gene = want.per_gene.set_index("response_id")
+    assert per_gene.loc["G7", "trans_pairs"] == 0
+    gene_chrom = genes.set_index("response_id")["chrom"]
+    excluded = want.background["response_id"].map(gene_chrom).isin(exclude)
+    assert not excluded.any() and len(want.background) > 0
+    if exclude == ("chr3",):
+        assert (per_gene.loc[gene_chrom.index[gene_chrom == "chr3"], "trans_pairs"] == 0).all()
+
+
+def test_a_screened_cis_result_is_refused_like_a_screened_trans_one():
+    cis, trans, elements, genes = _screen(12)
+    scr = _screened(cis)
+    assert {"fold_change", "early_stop"} <= set(scr.loc[scr["pass_qc"], "screen"])
+
+    # Safe at the cutoff and the nominal level: every table but links unchanged.
+    full = _check(cis, trans, elements, genes)
+    got = _check(scr, trans, elements, genes)
+    for name in TABLES:
+        if name != "links":
+            pd.testing.assert_frame_equal(getattr(full, name), getattr(got, name), check_exact=True)
+    assert full.background_rate == got.background_rate
+    shared = ["grna_target", "response_id", "log_2_fold_change", "distance", "link"]
+    pd.testing.assert_frame_equal(full.links[shared], got.links[shared], check_exact=True)
+    none = (got.links["screen"] == "none").to_numpy()
+    assert np.array_equal(full.links["p_value"][none], got.links["p_value"][none])
+    assert got.links["p_value"][~none].isna().all()
+
+    # Links of elements stopped early with a floor at the cutoff or below: refused.
+    tss = set(full.tss_targets["grna_target"])
+    called = (
+        (scr["screen"] == "none")
+        & (scr["p_value"] < CUTOFF)
+        & (scr["fold_change"] < 1)
+        & scr["pass_qc"]
+        & ~scr["grna_target"].isin(tss)
+    )
+    rows = scr.index[called][:5]
+    bad = scr.copy()
+    bad.loc[rows, ["screen", "p_value_floor"]] = ["early_stop", 0.005]
+    bad.loc[rows, "p_value"] = np.nan
+    message = r"cis_result has 5 row\(s\) with screen 'early_stop'.*not above the cutoff 0\.01"
+    with pytest.raises(ValueError, match=message):
+        cis_links(bad, elements, genes, CUTOFF)
+    with pytest.raises(ValueError, match=message):
+        _check(bad, trans, elements, genes)
+    # Above the cutoff they are tests that are not links.
+    safe = bad.copy()
+    safe.loc[rows, "p_value_floor"] = 0.02
+    accepted = cis_links(safe, elements, genes, CUTOFF)
+    assert list(accepted.columns) == [
+        "grna_target",
+        "response_id",
+        "p_value",
+        "log_2_fold_change",
+        "screen",
+        "p_value_floor",
+        "distance",
+        "link",
+    ]
+    assert not _rows(accepted, bad.loc[rows])["link"].any()
+    # A control target's rows are left out of the links, so they are not read.
+    controls = set(bad.loc[rows, "grna_target"])
+    kept = cis_links(bad, elements, genes, CUTOFF, control_targets=controls)
+    assert not kept["grna_target"].isin(controls).any()
 
 
 def test_a_cross_chromosome_cis_pair_is_listed():

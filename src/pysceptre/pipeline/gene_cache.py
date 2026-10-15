@@ -1,8 +1,10 @@
 """Width-1 gene fits, computed once and reused by later runs.
 
 `fit_gene_cache` fits genes with the call the complement engine makes, one
-gene per BLAS call against the shared covariate outer products, so each fit is
-the engine's fit, bit for bit in the same numeric environment.
+gene at a time (under the default `glm_solver="outer"`, one BLAS call per
+gene against the shared covariate outer products; under `"structured"`, the
+structured IRLS), so each fit is the engine's fit, bit for bit in the same
+numeric environment and for a covariate matrix of the same memory layout.
 `save_gene_cache` writes the fits with a fingerprint of what they depend on to
 an `.npz` that loads without pickle, and `load_gene_cache` reads one or
 several such files, refusing any whose fingerprint does not match the data,
@@ -50,6 +52,7 @@ _DATA_KEYS = (
     "n_covariates",
     "dfr",
     "covariate_sha256",
+    "covariate_layout",
     "theta_bounds",
     "batch_width",
     "glm_solver",
@@ -63,7 +66,9 @@ class GeneFitCache:
     `fits` maps a gene id to its `GenePrecomputation`, as `fit_all_genes`
     returns it. `fingerprint` holds `format`; `n_cells`, `n_covariates` and
     `dfr` of the fit; `covariate_sha256`, of the covariate matrix as float64
-    C-order bytes; `theta_bounds` and `batch_width`, the engine settings the
+    C-order bytes; `covariate_layout`, that matrix's memory layout ("C", "F"
+    or "strided"), which the fits depend on in their last bits;
+    `theta_bounds`, `batch_width` and `glm_solver`, the engine settings the
     fits were made with; `count_digests`, per gene the `nnz`, `sum` and `sha1`
     of its nonzero counts; and `environment`, an `environment_fingerprint()`.
     """
@@ -76,6 +81,18 @@ def _covariate_sha256(covariate_matrix: np.ndarray) -> str:
     """sha256 hex digest of the matrix as little-endian float64, C order."""
     X = np.ascontiguousarray(covariate_matrix, dtype="<f8")
     return hashlib.sha256(X).hexdigest()
+
+
+def _covariate_layout(covariate_matrix: np.ndarray) -> str:
+    """The memory layout: "C" (row-major), "F" (column-major) or "strided" (neither).
+
+    A matrix that is both, with one row or one column, is "C".
+    """
+    if covariate_matrix.flags.c_contiguous:
+        return "C"
+    if covariate_matrix.flags.f_contiguous:
+        return "F"
+    return "strided"
 
 
 def _row_nonzeros(response_matrix, row: int) -> tuple[np.ndarray, np.ndarray]:
@@ -132,15 +149,19 @@ def fit_gene_cache(
 
     The covariate matrix is validated and converted as `run_discovery_analysis`
     does, and the fits are the engine's own `fit_all_genes` call: one gene per
-    BLAS call, the shared `x_outer_flat`, the engine's gene memory budget. A
-    gene's fit depends only on its counts and the covariates, so fitting any
-    subset gives each gene the fit a run over all of them gives it.
+    fit and the engine's gene memory budget, with the shared `x_outer_flat`
+    under the default `glm_solver="outer"` and the structured design under
+    `"structured"`. A gene's fit depends only on its counts and the
+    covariates, so fitting any subset gives each gene the fit a run over all
+    of them gives it. The fits also depend on the covariate matrix's memory
+    layout, which the fingerprint records; the matrix is used as given.
 
     Args:
         response_matrix: (n_genes, n_cells) counts, dense or sparse, as for
             `run_discovery_analysis`.
         gene_ids: the row labels of `response_matrix`, in order.
-        covariate_matrix: (n_cells, p) design matrix.
+        covariate_matrix: (n_cells, p) design matrix, in the memory layout the
+            fits will be used with.
         genes: the genes to fit; None fits every row. Fitted in `gene_ids` order.
         n_jobs: workers for the fits; cannot change a fit.
         glm_solver: the engine's `glm_solver`, recorded in the fingerprint;
@@ -200,6 +221,7 @@ def fit_gene_cache(
         "n_covariates": int(p),
         "dfr": int(n_cells - p),
         "covariate_sha256": _covariate_sha256(covariate_matrix),
+        "covariate_layout": _covariate_layout(covariate_matrix),
         **_engine_settings(),
         "glm_solver": glm_solver,
         "count_digests": {
@@ -278,8 +300,11 @@ def _read(path) -> tuple[dict[str, GenePrecomputation], dict]:
     if not isinstance(fp, dict) or fp.get("format") != _FORMAT:
         got = fp.get("format") if isinstance(fp, dict) else None
         raise ValueError(f"{not_cache}: format {got!r}, expected {_FORMAT!r}")
-    # Caches written before the structured solver existed hold outer-product fits.
-    fp.setdefault("glm_solver", "outer")
+    if "covariate_layout" not in fp:
+        raise ValueError(
+            f"{path} does not record the memory layout of the covariate matrix its genes were "
+            "fit with, which the fits depend on; refit them with fit_gene_cache"
+        )
     missing = [k for k in (*_DATA_KEYS, "count_digests", "environment") if k not in fp]
     if missing:
         raise ValueError(f"{not_cache}: its fingerprint lacks {missing}")
@@ -317,6 +342,94 @@ def _read(path) -> tuple[dict[str, GenePrecomputation], dict]:
     return fits, fp
 
 
+def _check_data(
+    fingerprint: dict,
+    *,
+    response_matrix=None,
+    gene_ids=None,
+    covariate_matrix=None,
+    glm_solver: str | None = None,
+    genes=None,
+) -> None:
+    """Refuse data, or a `glm_solver`, other than the fits in `fingerprint` were made with.
+
+    `covariate_matrix` must have the fits' shape, float64 values and memory
+    layout. `response_matrix` must have their cell count, and every gene of
+    `genes` (by default every gene with a count digest) must be in `gene_ids`
+    and have the counts it was fit on. Arguments left None are not checked;
+    `response_matrix` and `gene_ids` are checked together.
+
+    Raises:
+        ValueError: the fingerprint lacks what a check needs, or the data or
+            solver differ; the message names what differs.
+    """
+    if (response_matrix is None) != (gene_ids is None):
+        raise ValueError("response_matrix and gene_ids are checked together: give both or neither")
+    needed = ["n_cells", "n_covariates"]
+    if glm_solver is not None:
+        needed.append("glm_solver")
+    if covariate_matrix is not None:
+        needed += ["covariate_sha256", "covariate_layout"]
+    if response_matrix is not None:
+        needed.append("count_digests")
+    missing = [k for k in needed if k not in fingerprint]
+    if missing:
+        raise ValueError(
+            f"the gene fits' fingerprint lacks {missing}, so they cannot be checked against "
+            "the data; refit them with fit_gene_cache"
+        )
+    if glm_solver is not None and fingerprint["glm_solver"] != glm_solver:
+        raise ValueError(
+            f"the gene fits were made with glm_solver={fingerprint['glm_solver']!r}, "
+            f"not {glm_solver!r}"
+        )
+    n_cells, p = fingerprint["n_cells"], fingerprint["n_covariates"]
+    if covariate_matrix is not None:
+        X = np.asarray(covariate_matrix, dtype=float)
+        if X.shape != (n_cells, p):
+            raise ValueError(
+                f"covariate_matrix has shape {X.shape}; the gene fits were made with "
+                f"({n_cells}, {p})"
+            )
+        digest = _covariate_sha256(X)
+        if digest != fingerprint["covariate_sha256"]:
+            raise ValueError(
+                f"covariate_matrix differs from the one the gene fits were made with: sha256 "
+                f"{digest} of its float64 bytes, expected {fingerprint['covariate_sha256']}"
+            )
+        layout = _covariate_layout(X)
+        if layout != fingerprint["covariate_layout"]:
+            raise ValueError(
+                f"covariate_matrix has memory layout {layout!r}; the gene fits were made with "
+                f"a {fingerprint['covariate_layout']!r} one, and a fit depends on the layout "
+                "in its last bits. Pass the matrix in the layout the fits were made with, or "
+                "refit them"
+            )
+    if response_matrix is not None:
+        if response_matrix.shape[1] != n_cells:
+            raise ValueError(
+                f"response_matrix has {response_matrix.shape[1]} cells; the gene fits were "
+                f"made with {n_cells}"
+            )
+        digests = fingerprint["count_digests"]
+        genes = list(digests) if genes is None else list(genes)
+        row_of = {g: i for i, g in enumerate(gene_ids)}
+        absent = [g for g in genes if g not in row_of]
+        if absent:
+            raise ValueError(f"{len(absent)} cached gene(s) are not in gene_ids, e.g. {absent[:5]}")
+        changed = [
+            g
+            for g in genes
+            if g not in digests
+            or not _same_digest(_count_digest(response_matrix, row_of[g]), digests[g])
+        ]
+        if changed:
+            raise ValueError(
+                f"the counts of {len(changed)} cached gene(s) differ from the counts they "
+                f"were fit on, e.g. {changed[:5]}"
+            )
+
+
 def _environment_differences(saved: dict, current: dict) -> str:
     a, b = _numeric_components(saved), _numeric_components(current)
     parts = [f"{k} {a[k]!r} in the cache, {b[k]!r} here" for k in a if a[k] != b[k]]
@@ -337,16 +450,19 @@ def load_gene_cache(
     Several files are merged into one cache; they must hold disjoint genes fit
     on the same data with the same settings. Every file must carry the
     engine's current gene batch width (1) and theta bounds. Given the data,
-    the covariate matrix must hash to the fingerprint's and every cached
-    gene's counts must match its digest. With `check_environment`, every
-    file's `numeric_environment_key` must equal this process's. See
-    docs/design.md, "The trans background".
+    the covariate matrix must hash to the fingerprint's and have its memory
+    layout, and every cached gene's counts must match its digest. With
+    `check_environment`, every file's `numeric_environment_key` must equal
+    this process's. A file whose fingerprint does not record the covariate
+    layout is refused, to be refit. See docs/design.md, "The trans
+    background".
 
     Args:
         paths: one path, or a sequence of paths.
         response_matrix, gene_ids: the data the fits will be used with; checked
             together, so give both or neither.
-        covariate_matrix: the covariate matrix the fits will be used with.
+        covariate_matrix: the covariate matrix the fits will be used with, in
+            the memory layout they will be used with.
         check_environment: refuse fits made in another numeric environment.
         glm_solver: refuse fits made with another `glm_solver`; None accepts
             either, provided all files agree.
@@ -357,11 +473,13 @@ def load_gene_cache(
         environment of the first file. Floats are bitwise those saved.
 
     Raises:
-        ValueError: no path; a file `save_gene_cache` did not write; another
-            batch width or theta bounds; files fit on different data or
-            settings, or sharing a gene; a covariate matrix, cell count, gene
-            or counts other than the fits were made with; or another numeric
-            environment. The message names what differs.
+        ValueError: no path; a file `save_gene_cache` did not write, or one
+            that does not record the covariate layout; another batch width,
+            theta bounds or `glm_solver`; files fit on different data or
+            settings, or sharing a gene; a covariate matrix (values or memory
+            layout), cell count, gene or counts other than the fits were made
+            with; or another numeric environment. The message names what
+            differs.
     """
     if isinstance(paths, (str, os.PathLike)):
         paths = [paths]
@@ -425,44 +543,15 @@ def load_gene_cache(
                     "check_environment=False"
                 )
 
-    n_cells, p = first["n_cells"], first["n_covariates"]
-    if covariate_matrix is not None:
-        X = np.asarray(covariate_matrix, dtype=float)
-        if X.shape != (n_cells, p):
-            raise ValueError(
-                f"covariate_matrix has shape {X.shape}; the gene fits were made with "
-                f"({n_cells}, {p})"
-            )
-        digest = _covariate_sha256(X)
-        if digest != first["covariate_sha256"]:
-            raise ValueError(
-                f"covariate_matrix differs from the one the gene fits were made with: sha256 "
-                f"{digest} of its float64 bytes, expected {first['covariate_sha256']}"
-            )
-    if response_matrix is not None:
-        if response_matrix.shape[1] != n_cells:
-            raise ValueError(
-                f"response_matrix has {response_matrix.shape[1]} cells; the gene fits were "
-                f"made with {n_cells}"
-            )
-        row_of = {g: i for i, g in enumerate(gene_ids)}
-        absent = [g for g in fits if g not in row_of]
-        if absent:
-            raise ValueError(f"{len(absent)} cached gene(s) are not in gene_ids, e.g. {absent[:5]}")
-        changed = [
-            g
-            for g in fits
-            if not _same_digest(_count_digest(response_matrix, row_of[g]), digests[g])
-        ]
-        if changed:
-            raise ValueError(
-                f"the counts of {len(changed)} cached gene(s) differ from the counts they "
-                f"were fit on, e.g. {changed[:5]}"
-            )
-
     fingerprint = {
         **{k: first[k] for k in _DATA_KEYS},
         "count_digests": digests,
         "environment": first["environment"],
     }
+    _check_data(
+        fingerprint,
+        response_matrix=response_matrix,
+        gene_ids=gene_ids,
+        covariate_matrix=covariate_matrix,
+    )
     return GeneFitCache(fits=fits, fingerprint=fingerprint)

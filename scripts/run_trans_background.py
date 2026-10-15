@@ -22,7 +22,12 @@ as parquet parts per group of genes, each renamed into place when complete,
 so a restarted shard skips finished parts. `combine` checks that every
 QC-passing trans pair appears exactly once and that the audit sample agrees
 with the screens, and writes one table. `specificity` runs
-`run_specificity_check` with the cutoff the cis analysis was called at.
+`run_specificity_check` at `--cutoff`, or by default at the BH cutoff at
+`--bh-alpha` over the finite cis p-values left after `--exclude-pairs`: the
+cutoff the cis analysis was called at, when `--exclude-pairs` flags the pairs
+that analysis left out of its correction. Cis pairs whose target or gene has
+no position, or whose element and gene lie on different chromosomes, are then
+dropped from the check without moving the cutoff, and listed in `summary.json`.
 See docs/design.md, "The trans background".
 """
 
@@ -124,6 +129,12 @@ def _load(a: argparse.Namespace):
     return load_export_compact(a.dataset, genes="pairs")
 
 
+def _reference_genes(ex) -> list[str]:
+    """The genes of `ex`'s pairs in matrix order, whether `ex` holds only those or every gene."""
+    wanted = set(ex.pairs["response_id"])
+    return [g for g in ex.gene_ids if g in wanted]
+
+
 def cmd_fit_genes(a: argparse.Namespace) -> None:
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -134,7 +145,7 @@ def cmd_fit_genes(a: argparse.Namespace) -> None:
     t0 = time.time()
     # The reference run's genes only, in matrix order: the list build_trans_pairs.py writes.
     ex = _load(a)
-    genes = list(ex.gene_ids)
+    genes = _reference_genes(ex)
     mine = [str(g) for g in np.array_split(np.asarray(genes, dtype=object), a.n_tasks)[a.task]]
     print(
         f"loaded in {time.time() - t0:.0f}s; fitting {len(mine)} of {len(genes)} genes", flush=True
@@ -495,22 +506,30 @@ def cmd_specificity(a: argparse.Namespace) -> None:
             a.exclude_pairs, sep="\t", usecols=["response_id", "grna_target", a.exclude_column]
         )
         excl = excl.loc[excl[a.exclude_column].astype(bool), ["response_id", "grna_target"]]
-        cis = cis.merge(excl.assign(_x=True), on=["response_id", "grna_target"], how="left")
-        notes["excluded_by_" + a.exclude_column] = int(cis["_x"].fillna(False).astype(bool).sum())
-        cis = cis.loc[~cis["_x"].fillna(False).astype(bool)].drop(columns="_x")
+        drop = pd.MultiIndex.from_frame(cis[["response_id", "grna_target"]]).isin(
+            pd.MultiIndex.from_frame(excl)
+        )
+        notes["excluded_by_" + a.exclude_column] = int(drop.sum())
+        cis = cis.loc[~drop].reset_index(drop=True)
+    # The cutoff is taken here: the pairs dropped below for their positions do not move it.
+    if a.cutoff is not None:
+        cutoff = a.cutoff
+    else:
+        p = cis["p_value"].to_numpy(float)
+        cutoff = bh_nominal_cutoff(p, a.bh_alpha)
+        notes["cutoff_bh"] = {"alpha": a.bh_alpha, "p_values": int(np.isfinite(p).sum())}
+    notes["cutoff"] = cutoff
     chrom = dict(zip(measured["response_id"], measured["chrom"], strict=True))
     e_chrom = dict(zip(elements["grna_target"], elements["chrom"], strict=True))
-    spans = cis["grna_target"].map(e_chrom) != cis["response_id"].map(chrom)
-    notes["cis_pairs_spanning_chromosomes_dropped"] = cis.loc[
-        spans, ["grna_target", "response_id"]
-    ].values.tolist()
-    cis = cis.loc[~spans].reset_index(drop=True)
-    cutoff = (
-        a.cutoff
-        if a.cutoff is not None
-        else bh_nominal_cutoff(cis["p_value"].dropna().to_numpy(), a.bh_alpha)
-    )
-    notes["cutoff"] = cutoff
+    e_of, g_of = cis["grna_target"].map(e_chrom), cis["response_id"].map(chrom)
+    unplaced = (e_of.isna() | g_of.isna()).to_numpy()
+    spans = ~unplaced & (e_of != g_of).to_numpy()
+    for key, rows in (
+        ("cis_pairs_without_position_dropped", unplaced),
+        ("cis_pairs_spanning_chromosomes_dropped", spans),
+    ):
+        notes[key] = cis.loc[rows, ["grna_target", "response_id"]].values.tolist()
+    cis = cis.loc[~(unplaced | spans)].reset_index(drop=True)
 
     t = pq.read_table(a.trans).to_pandas()
     if a.subset_shards:
@@ -569,7 +588,10 @@ def cmd_specificity(a: argparse.Namespace) -> None:
     print(res.by_distance.to_string())
     print(
         json.dumps(
-            {k: v for k, v in notes.items() if k != "cis_pairs_spanning_chromosomes_dropped"},
+            {
+                k: len(v) if k.startswith("cis_pairs_") and k.endswith("_dropped") else v
+                for k, v in notes.items()
+            },
             indent=1,
         )
     )
@@ -605,7 +627,8 @@ def main() -> None:
         "--fit-concurrency",
         type=int,
         default=12,
-        help="target chunks fit at once; each is one single-threaded batched fit",
+        help="target chunks fit at once (under --glm-solver outer each is one batched fit, "
+        "under structured its targets are fit on a thread pool)",
     )
     s.add_argument("--audit-every", type=int, default=1000, help="audit about 1 pair in this many")
     s.add_argument("--genes-per-part", type=int, default=256)
@@ -634,10 +657,19 @@ def main() -> None:
     p.add_argument("--trans", required=True, help="combine's trans_result.parquet")
     p.add_argument("--out", required=True)
     p.add_argument("--manifest", help="default: PAIRS_DIR/shard_manifest.json")
-    p.add_argument("--cutoff", type=float, help="nominal cutoff; default BH over the cis p-values")
-    p.add_argument("--bh-alpha", type=float, default=0.1)
-    p.add_argument("--exclude-pairs", help="TSV with response_id, grna_target and a flag column")
-    p.add_argument("--exclude-column", default="self_targeting")
+    p.add_argument(
+        "--cutoff",
+        type=float,
+        help="nominal cutoff; default: BH at --bh-alpha over the finite --cis-tsv p-values "
+        "left after --exclude-pairs, before cis pairs are dropped for their positions",
+    )
+    p.add_argument("--bh-alpha", type=float, default=0.1, help="FDR level of the default cutoff")
+    p.add_argument(
+        "--exclude-pairs",
+        help="TSV with response_id, grna_target and a flag column; flagged cis pairs leave "
+        "the check and the default cutoff",
+    )
+    p.add_argument("--exclude-column", default="self_targeting", help="the flag column")
     p.add_argument("--subset-shards", type=int, nargs="*", help="an interim run on these shards")
     p.add_argument("--n-bootstrap", type=int, default=2000)
     p.add_argument("--seed", type=int, default=0)

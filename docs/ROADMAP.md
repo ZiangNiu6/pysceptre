@@ -276,9 +276,9 @@ Output is bit-for-bit identical, row order included.
 element x gene pairs on a transcriptome-wide screen. On a 1.55M-cell screen
 with 69 covariates (10.5k elements x 10.8k genes, 1.0e8 QC-passing trans
 pairs), `run_trans_analysis` with its two screens is estimated at 2.3M to 2.7M
-core-s: about 1,000 cores for an hour. The aim is 128 cores for about half an
-hour, as **8 jobs of 16 cores**, each well under 128 GB, because jobs of that
-shape schedule far more easily than whole nodes.
+core-s: about 640 to 750 cores for an hour. The aim is 128 cores for about
+half an hour, as **8 jobs of 16 cores**, each well under 128 GB, because jobs
+of that shape schedule far more easily than whole nodes.
 
 **Already in place.** The trans engine, its screens and the gene-fit cache
 (docs/design.md, "The trans background"); `glm_solver="structured"`, which

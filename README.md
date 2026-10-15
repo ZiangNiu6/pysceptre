@@ -45,7 +45,11 @@ pip install -e ".[dev,fast]"
 - `fast` installs [`numba`](https://numba.readthedocs.io/), which JIT-compiles
   the CRT sampler's cell-grouping step (a counting sort). Without it,
   `pysceptre` falls back to a slower pure-numpy `argsort`-based version
-  automatically -- everything still works, just slower at real dataset scale.
+  automatically, and everything except `run_trans_analysis` still works, just
+  slower at real dataset scale. The fallback lists a resample's cells in
+  another order, so a CRT result can differ in its last bits from one made
+  with numba; `run_trans_analysis`, which must reproduce a reference run bit
+  for bit, needs numba and raises `RuntimeError` without it.
 - `io` installs `mudata`, `anndata`, `pyarrow` and `matplotlib`. These are
   needed only by the dataset-export and benchmarking scripts under
   `scripts/`, **not** by the package: `run_discovery_analysis` takes in-memory
@@ -64,7 +68,13 @@ works. The `scripts/` directory also carries one out of R end to end:
 `var` marks each unit as a per-target union or an individual non-targeting
 gRNA). `scripts/sceptre_io.load_export` reads one back, and with
 `backed=True` serves genes from disk on demand rather than holding the whole
-matrix.
+matrix. A backed read of the cells in use needs a file holding only those
+cells, which `scripts/write_in_use_h5mu.py` writes from an export that kept
+every cell (the export's default). `load_export_compact` instead holds only
+the genes a run needs, restricted to the cells in use. Read from a `.h5mu`,
+the covariate matrix comes back row-major whatever the file: BLAS rounds a
+row-major and a column-major matrix differently, and one layout gives every
+such file the same bits.
 
 <!-- --8<-- [end:installation] -->
 
@@ -161,7 +171,7 @@ run_discovery_analysis(
 | `n_jobs` | `int` | Workers for the per-pair tests, which are ~80% of the runtime. `1` (default) runs serially; a negative value uses every core. **Results do not depend on it** -- only the genes inside an already-drawn target chunk are distributed, so the resampling draws are made in the same order at any worker count, and output is bit-identical. Processes on Linux, threads elsewhere (`fork` after macOS's Accelerate BLAS can deadlock), so the ceiling is lower off Linux; against the NT cells, where every pair is a GLM fit, threads are capped at four because more contend for the GIL. Memory grows by about one gene's working arrays per worker, not by `chunk_memory_gb` per worker. |
 | `chunk_memory_gb` | `float` | Budget for the arrays a *chunk* holds, which sizes how many genes or targets are processed together. **Not** a cap on the process's memory -- the input, retained state and allocator overhead sit outside it. **You should not normally need to change this.** The default is both the fastest and the leanest setting measured: a larger budget produces chunks past the point where batching still pays, costing memory for no throughput (4 GB gave 8.42 GB peak against 3.78 GB at 1 GB, for the same runtime). Default `1.0`. |
 | `grna_target_weights` | `dict[str, np.ndarray] \| None` | Runs the **dose test** instead of sceptre's: each target's cells enter the test with these weights, aligned with `grna_target_cells`, in place of 1. Not from sceptre -- see [`dose_weights`](#pysceptredose_weights), which builds both dicts from gRNA counts. Weights must be finite and positive; all-ones weights give sceptre's result exactly. Complement control group, CRT and the union strategy only. |
-| `glm_solver` | `"outer"` \| `"structured"` | How the gene and target GLMs are fit. `"outer"` (default) is 0.5.0's IRLS and reproduces its results bit for bit. `"structured"` forms the same normal equations from the covariate matrix's 0/1 indicator columns, so a design with many batch dummies costs far less time and needs no `(n_cells, p^2)` array, and it fits each target on its own, so a target's fit does not depend on its chunk. It fits the same GLM, not to the same last bits: a gene whose counts are close to Poisson can get a different dispersion estimate, as it can on another CPU. Complement control group only; anything else raises `ValueError`. Not from sceptre -- see [Design decisions](https://broadinstitute.github.io/pysceptre/design/#indicator-columns-in-the-irls). |
+| `glm_solver` | `"outer"` \| `"structured"` | How the gene and target GLMs are fit. `"outer"` (default) is 0.5.0's IRLS and reproduces its results bit for bit. `"structured"` forms the same normal equations from the covariate matrix's 0/1 indicator columns, so a design with many batch dummies costs far less time and needs no `(n_cells, p^2)` array, and it fits each target on its own, so a target's fit does not depend on its chunk. It fits the same GLM, not to the same bits: the two routes round differently, and the IRLS carries that well past the last bits on a design with many columns (fitted means agreed to 7.5e-9 relative on the one design measured), while a gene whose counts are close to Poisson can get a different dispersion estimate, as it can on another CPU. Complement control group only, in all three analyses; anything else raises `ValueError`. Not from sceptre -- see [Design decisions](https://broadinstitute.github.io/pysceptre/design/#indicator-columns-in-the-irls). |
 
 **Returns** a `pd.DataFrame`, one row per input pair, with columns:
 
@@ -461,14 +471,14 @@ trans_result = run_trans_analysis(
 
 | Argument | Notes |
 |---|---|
-| `response_matrix`, `gene_ids`, `covariate_matrix`, `grna_target_cells` | The same objects the reference run was given. |
+| `response_matrix`, `gene_ids`, `covariate_matrix`, `grna_target_cells` | The same objects the reference run was given, the covariate matrix in the same memory layout: a row-major and a column-major copy give different last bits. |
 | `pairs` | The background pairs, QC-passed, with an optional `mode` column: `"screened"` (default), `"full"` or `"audit"`. |
 | `reference_pairs` | The pairs the reference run was given; they fix its target chunks. |
 | `seed`, `side`, `resampling_approximation`, `target_chunk_size`, `chunk_memory_gb`, `glm_solver` | The reference run's settings. `seed` is required, and the approximation must be `"skew_normal"`. |
 | `expected_fit_chunks`, `fit_chunk_ids` | The reference layout's `(width, count)`, refused when different, and the reference chunks this call fits, for a run split into shards. |
-| `gene_fits` | Gene fits to reuse (`pysceptre.pipeline.gene_cache`); a cache made with another `glm_solver` is refused. |
-| `p_exact_below`, `block_rows` | Where the first-stage early stop may stop, and how often it checks. |
-| `n_jobs`, `backend`, `fit_concurrency` | Workers for the tests, their backend, and target chunks fit at once. None of them changes a result. |
+| `gene_fits` | Gene fits to reuse, from `pysceptre.pipeline.gene_cache` (`fit_gene_cache`, `save_gene_cache`, `load_gene_cache`). A `GeneFitCache` is checked against this call's data as `load_gene_cache` checks it -- the covariate matrix's values and memory layout, the cell count, the counts of every gene it supplies -- and refused if made with another `glm_solver`. A plain dict of fits is not checked. |
+| `p_exact_below`, `block_rows` | Where the first-stage early stop may stop (default `0.05`), and how many first-stage resamples are evaluated between its checks (default `32`). `block_rows` decides only whether a pair stops early, and so its `screen`, `p_value_floor` and `n_null_evaluated`; a pair that is not screened gets the full test's result at any value. |
+| `n_jobs`, `backend`, `fit_concurrency` | Workers for the tests, their backend (`"fork"`, processes, or `"thread"`; the platform default when `None`), and target chunks fit at once. None of them changes a result. |
 
 Returns one row per pair, in `pairs` order: `response_id`, `grna_target`,
 `p_value`, `fold_change`, `se_fold_change`, `z_orig`, `stage`, `screen`,
@@ -479,8 +489,15 @@ be at least `p_exact_below` and the pair cannot escalate (`screen`
 "early_stop", the bound in `p_value_floor`): neither can be a call of the
 specificity check. A screened row's `p_value` is NaN and means "tested, not
 resampled", so use it for the check and not for a p-value distribution.
-Complement control group, CRT and the union strategy only. Why the cost is
-not per pair, and why both screens are exact, is in
+
+A pair tested in full gets the result the reference run gave it, bit for bit,
+when the reference run also had numba, ran on the same CPU class and BLAS,
+and was given the covariate matrix in the same memory layout
+([Reproducibility](#reproducibility-and-incremental-analysis)).
+Complement control group, CRT and the union strategy only. It needs numba
+(the `fast` extra) and raises `RuntimeError` without it, since without numba
+the CRT draws list their cells in another order. Why the cost is not per
+pair, and why both screens are exact, is in
 [Design decisions](https://broadinstitute.github.io/pysceptre/design/#the-trans-background).
 
 ### `pysceptre.assign_grnas`
@@ -778,22 +795,36 @@ One exception, by construction: under `resampling_approximation="no_approximatio
 the third batch is sized by the number of pairs, so changing the pair list
 re-draws every resample, on both mechanisms.
 
-Two limits on the CRT path, both worth knowing exactly:
+The limits on the CRT path, worth knowing exactly:
 
 | change between runs | shared pairs |
 |---|---|
 | more or fewer pairs of the same targets, or genes; a different pair order; different `n_jobs` | **bitwise identical** |
 | different target chunks: other targets, another order of `grna_target_cells`, or another `target_chunk_size` | **bitwise identical** with `glm_solver="structured"`; with the default `"outer"`, on some BLAS kernels a target's fitted probabilities differ in the last bits, which very rarely moves a resample |
-| another CPU type | the same to rounding, not bitwise |
+| the covariate matrix row-major in one run and column-major in the other | the same to rounding, not bitwise, except as below |
+| numba in one run and not in the other | the same to rounding, not always bitwise: the same resamples, some with their cells listed in another order |
+| another CPU type | the same to rounding, not bitwise, except as below |
 
-Neither is randomness. Gene GLMs are fitted one gene at a time, so the set of
-genes never matters. Target GLMs are fitted a chunk at a time on the default
-route, and a batched BLAS product need not give one column the same last bits
-in every batch; `glm_solver="structured"` fits each target alone
+None of these is randomness. Gene GLMs are fitted one gene at a time, so the
+set of genes never matters. Target GLMs are fitted a chunk at a time on the
+default route, and a batched BLAS product need not give one column the same
+last bits in every batch; `glm_solver="structured"` fits each target alone
 ([Design decisions](https://broadinstitute.github.io/pysceptre/design/#indicator-columns-in-the-irls)).
-numpy and OpenBLAS choose their kernels by CPU model, so the same code gives
-different last bits on different machines
+BLAS rounds a product differently for the two memory layouts, and
+`pysceptre` uses the covariate matrix in the layout it is given, so give
+every run that must agree bit for bit the same layout, for example
+`np.ascontiguousarray(covariate_matrix)`. Without numba the CRT sampler lists
+each resample's cells in another order, and a null statistic adds them up in
+that order. numpy and OpenBLAS choose their kernels by CPU model, so the same
+code gives different last bits on different machines
 ([Design decisions](https://broadinstitute.github.io/pysceptre/design/#bits-depend-on-the-machine)).
+
+**The exception is a gene close to Poisson.** In the two rows marked "except
+as below" the gene fits themselves differ in their last bits, and for a gene
+with little or no overdispersion which branch the dispersion estimate ends on
+can turn on those bits. Such a gene's `theta`, and with it its p-values, can
+then differ by much more than rounding
+([Design decisions](https://broadinstitute.github.io/pysceptre/design/#a-dispersion-estimate-can-stop-on-a-rounding-accident)).
 
 **Adjusted p-values are a different matter and must be recomputed.** A
 Benjamini-Hochberg adjustment depends on every p-value in the set, so adding
@@ -912,6 +943,21 @@ adjustment over the union each time.
   reproduces on three screens; nothing external has checked it. The
   fingerprint part of that analysis is not included -- see
   [Design decisions](https://broadinstitute.github.io/pysceptre/design/#specificity-check).
+- **`run_trans_analysis`, which computes that check's background, is not
+  sceptre's either, and is checked against pysceptre only.** It tests
+  background pairs with a reference discovery run's own test, and a pair
+  tested in full gets that run's result bit for bit, given the same CPU
+  class, BLAS and covariate layout; nothing compares it with R. Complement
+  control group, CRT, `skew_normal` and the union strategy only, and it needs
+  numba. A screened row has no p-value, so a trans result serves the
+  specificity check and not a p-value distribution -- see
+  [Design decisions](https://broadinstitute.github.io/pysceptre/design/#the-trans-background).
+- **`glm_solver="structured"` is not sceptre's route to its GLMs.** It fits
+  the same models by per-level sums over the covariate matrix's indicator
+  columns, and its fits are checked against R's and against the default
+  route's, but not to the same bits, so the default stays `"outer"`, which
+  reproduces 0.5.0's results. Complement control group only -- see
+  [Design decisions](https://broadinstitute.github.io/pysceptre/design/#indicator-columns-in-the-irls).
 
 <!-- --8<-- [end:scope] -->
 

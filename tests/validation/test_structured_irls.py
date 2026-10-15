@@ -26,7 +26,7 @@ from pysceptre.glm.irls import (
     structured_normal_equations,
 )
 from pysceptre.glm.nb_theta import estimate_theta
-from pysceptre.pipeline.api import run_discovery_analysis
+from pysceptre.pipeline.api import run_calibration_check, run_discovery_analysis
 
 
 def _design(n=30_000, seed=0):
@@ -325,6 +325,39 @@ def test_an_unknown_solver_is_refused_on_either_control_group():
             ntc_grna_cells={"nt1": np.arange(1_900, 2_000)},
             glm_solver="qr",
         )
+
+
+def test_the_calibration_check_refuses_the_structured_solver_against_the_nt_cells():
+    """As discovery does, although that check runs the complement engine inside the NT pool."""
+    counts, genes, X, _, _ = _screen(n=2_000)
+    ntc = {"nt1": np.arange(1_800, 1_900), "nt2": np.arange(1_900, 2_000)}
+    args = dict(n_calibration_pairs=4, calibration_group_size=1, seed=1)
+    with pytest.raises(ValueError, match="complement control group only"):
+        run_calibration_check(
+            counts,
+            genes,
+            X,
+            ntc,
+            moi="low",
+            control_group="nt_cells",
+            glm_solver="structured",
+            **args,
+        )
+    for control_group in ("nt_cells", "complement"):
+        with pytest.raises(ValueError, match="glm_solver must be one of"):
+            run_calibration_check(
+                counts,
+                genes,
+                X,
+                ntc,
+                moi="low",
+                control_group=control_group,
+                glm_solver="qr",
+                **args,
+            )
+    # The complement control group takes it.
+    result = run_calibration_check(counts, genes, X, ntc, glm_solver="structured", **args)
+    assert len(result) == 4 and result["p_value"].between(0.0, 1.0).all()
 
 
 @pytest.mark.skipif(not irls._HAVE_NUMBA, reason="needs numba")

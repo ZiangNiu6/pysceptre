@@ -14,6 +14,7 @@ import warnings
 import numpy as np
 import pandas as pd
 import pytest
+from threadpoolctl import threadpool_info, threadpool_limits
 
 pytest.importorskip("numba")
 
@@ -21,7 +22,12 @@ from pysceptre import run_specificity_check  # noqa: E402
 from pysceptre.crt import sampler as crt_sampler  # noqa: E402
 from pysceptre.pipeline.api import run_discovery_analysis, run_trans_analysis  # noqa: E402
 from pysceptre.pipeline.discovery import fit_all_genes  # noqa: E402
-from pysceptre.pipeline.trans import trans_fit_chunks  # noqa: E402
+from pysceptre.pipeline.gene_cache import fit_gene_cache  # noqa: E402
+from pysceptre.pipeline.trans import (  # noqa: E402
+    iter_trans_analysis,
+    trans_fit_chunks,
+    trans_results_frame,
+)
 
 N_CELLS, N_GENES, N_TARGETS, SEED, CHUNK = 40_000, 24, 18, 7, 4
 RESULT_COLUMNS = ["p_value", "fold_change", "se_fold_change", "z_orig", "stage"]
@@ -223,6 +229,104 @@ def test_reused_gene_fits_change_nothing(screen):
     fresh = _trans(screen, screen["trans"], screen["cis"])
     reused = _trans(screen, screen["trans"], screen["cis"], gene_fits=fits)
     _assert_same_results(reused, fresh)
+    cache = fit_gene_cache(screen["counts"], screen["genes"], screen["X"])
+    cached = _trans(screen, screen["trans"], screen["cis"], gene_fits=cache)
+    _assert_same_results(cached, fresh)
+
+
+def _chunk_pairs(s, ids):
+    """The trans pairs whose targets lie in the reference chunks `ids`."""
+    chunks = trans_fit_chunks(
+        s["targets"], s["cis"], len(s["X"]), target_chunk_size=CHUNK, chunk_memory_gb=1.0
+    )
+    mine = {t for i in ids for t in chunks[i]}
+    return s["trans"].loc[s["trans"]["grna_target"].isin(mine)].reset_index(drop=True)
+
+
+def test_a_gene_fit_cache_is_checked_against_the_data(screen):
+    s = screen
+    cache = fit_gene_cache(s["counts"], s["genes"], s["X"])
+    pairs = _chunk_pairs(s, [0])
+    pairs = pairs.loc[pairs["response_id"].isin(s["genes"][:6])].reset_index(drop=True)
+    used, unused = pairs["response_id"].iloc[0], s["genes"][-1]
+
+    changed = s["counts"].copy()
+    changed[s["genes"].index(used), 0] += 1
+    with pytest.raises(ValueError, match=rf"counts of 1 cached gene\(s\) differ.*'{used}'"):
+        _trans({**s, "counts": changed}, pairs, s["cis"], gene_fits=cache)
+    # Only the genes the call tests are checked.
+    changed = s["counts"].copy()
+    changed[s["genes"].index(unused), 0] += 1
+    alone = _trans({**s, "counts": changed}, pairs, s["cis"], gene_fits=cache)
+    _assert_same_results(alone, _trans(s, pairs, s["cis"]))
+
+    nudged = s["X"].copy()
+    nudged[17, 1] = np.nextafter(nudged[17, 1], np.inf)
+    with pytest.raises(ValueError, match="covariate_matrix differs"):
+        _trans({**s, "X": nudged}, pairs, s["cis"], gene_fits=cache)
+    assert s["X"].flags.c_contiguous
+    with pytest.raises(ValueError, match="memory layout 'F'"):
+        _trans({**s, "X": np.asfortranarray(s["X"])}, pairs, s["cis"], gene_fits=cache)
+    fewer = fit_gene_cache(s["counts"][:, :-1], s["genes"], s["X"][:-1], genes=[used])
+    with pytest.raises(ValueError, match="covariate_matrix has shape"):
+        _trans(s, pairs, s["cis"], gene_fits=fewer)
+
+
+def _blas_threads() -> list[int]:
+    return sorted({d["num_threads"] for d in threadpool_info() if d["user_api"] == "blas"})
+
+
+@pytest.mark.parametrize("first_done", ["started_last", "started_first"])
+def test_interleaved_generators_keep_their_own_inputs(screen, first_done):
+    """Two generators advanced in turn in one thread give each its own results, bit for bit.
+
+    One BLAS thread holds until the last of them finishes, whichever that is,
+    and the limit found before them comes back after. They run under an outer
+    limit of two BLAS threads, so that a limit left behind shows.
+    """
+    s = screen
+    a_pairs, b_pairs = _chunk_pairs(s, [0]), _chunk_pairs(s, [1, 2])
+
+    def generator(pairs, ids):
+        return iter_trans_analysis(
+            s["counts"],
+            s["genes"],
+            s["X"],
+            s["targets"],
+            pairs,
+            reference_pairs=s["cis"],
+            seed=SEED,
+            target_chunk_size=CHUNK,
+            fit_chunk_ids=ids,
+        )
+
+    with threadpool_limits(limits=2, user_api="blas"), warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        before = _blas_threads()
+        alone_a = trans_results_frame(a_pairs, generator(a_pairs, [0]))
+        alone_b = trans_results_frame(b_pairs, generator(b_pairs, [1, 2]))
+        assert _blas_threads() == before
+        ga, gb = generator(a_pairs, [0]), generator(b_pairs, [1, 2])
+        got_a = [next(ga)]
+        got_b = [next(gb)]
+        # `ga` resumes while `gb` is suspended with its inputs in place.
+        got_a.append(next(ga))
+        held = _blas_threads()
+        if first_done == "started_last":
+            got_b.extend(gb)
+            between = _blas_threads()
+            got_a.extend(ga)
+        else:
+            got_a.extend(ga)
+            between = _blas_threads()
+            got_b.extend(gb)
+        after = _blas_threads()
+    one = [1] if before else []
+    assert held == one and between == one
+    assert after == before
+    assert len(got_a) > 2 and len(got_b) > 1
+    pd.testing.assert_frame_equal(trans_results_frame(a_pairs, got_a), alone_a, check_exact=True)
+    pd.testing.assert_frame_equal(trans_results_frame(b_pairs, got_b), alone_b, check_exact=True)
 
 
 def test_refusals(screen, monkeypatch):

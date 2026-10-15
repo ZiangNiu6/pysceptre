@@ -8,34 +8,83 @@ Notable changes per release. Dates are the release date.
 
 - **`glm_solver`** on `run_discovery_analysis`, `run_calibration_check`,
   `run_power_check` and `run_trans_analysis`. `"outer"`, the default, is
-  0.5.0's IRLS and leaves every result bit-identical. `"structured"` forms the
-  same weighted normal equations from the covariate matrix's 0/1 indicator
-  columns by per-level sums instead of the `(n_cells, p^2)` array of per-row
-  outer products, which on a design with many one-hot covariates (batch
-  dummies) costs far less time and memory. The same GLM, not the same bits. It
+  0.5.0's IRLS and leaves every result bit-identical for the same inputs.
+  `"structured"` forms the same weighted normal equations from the covariate
+  matrix's 0/1 indicator columns by per-level sums instead of the
+  `(n_cells, p^2)` array of per-row outer products, which on a design with
+  many one-hot covariates (batch dummies) costs far less time and memory. The
+  same GLM, not the same bits: the two routes round differently, and on a
+  design with many columns the IRLS carries that well past the last bits. It
   also fits each CRT target alone, so a target's fit no longer depends on the
-  other targets in its chunk. Complement control group only. Not from
+  other targets in its chunk. Complement control group only: against the NT
+  cells, the calibration check's included, it raises `ValueError`. Not from
   sceptre; see docs/design.md, "Indicator columns in the IRLS".
 - **`run_trans_analysis`**, not from sceptre: tests background pairs (the
   screen's elements against genes on other chromosomes) with a reference
   discovery run's test, for `run_specificity_check`. Targets are fit in the
   reference run's chunks, so a pair tested in full gets the reference run's
-  result bit for bit on the same CPU class. Two screens skip resampling that
-  cannot change the check's calls (`screen` "fold_change" and "early_stop",
-  `p_value` NaN). Gene fits can be cached and reused across shards
-  (`pysceptre.pipeline.gene_cache`). Complement control group, CRT,
-  `skew_normal` and the union strategy only. See docs/design.md, "The trans
-  background".
+  result bit for bit on the same CPU class and BLAS, given the covariate
+  matrix in the memory layout the reference run had. Two screens skip
+  resampling that cannot change the check's calls (`screen` "fold_change" and
+  "early_stop", `p_value` NaN). Needs numba, and raises `RuntimeError`
+  without it: the fallback lists a CRT draw's cells in another order, so it
+  would not reproduce a reference run made with numba. Complement control
+  group, CRT, `skew_normal` and the union strategy only. See docs/design.md,
+  "The trans background".
+- **`pysceptre.pipeline.gene_cache`**: `fit_gene_cache`, `save_gene_cache`
+  and `load_gene_cache` make width-1 gene fits once and reuse them across the
+  shards of a trans run, in an `.npz` that loads without pickle. The
+  fingerprint records the data (the cell count, the covariate matrix's digest
+  and memory layout, each gene's count digest), the engine settings,
+  `glm_solver` among them, and the numeric environment, and `load_gene_cache`
+  refuses fits that do not match the data it is given or this process's
+  numeric environment (the latter unless `check_environment=False`).
+  `run_trans_analysis` checks a `GeneFitCache` given as `gene_fits` against
+  its own data and `glm_solver` the same way, but not against the numeric
+  environment, which only `load_gene_cache` checks.
+- **Scripts for the trans background** (not shipped in the wheel).
+  `build_trans_pairs.py` enumerates a screen's background pairs with their
+  pairwise QC counts, the element and gene positions and the reference run's
+  target fit chunks, and splits the chunks into shards.
+  `run_trans_background.py` fits and caches the genes (`fit-genes`), tests a
+  shard (`shard`), checking each reference pair against the reference result
+  bit for bit as its gene comes up and stopping the shard on a difference,
+  checks and joins the shards (`combine`), and runs the specificity check
+  (`specificity`); `--glm-solver` selects the solver, and `--backed` reads
+  each gene from disk as it is reached instead of holding the counts in
+  memory. `measure_structured_irls.py` times the two solvers on a real
+  design.
+- **`scripts/sceptre_io.load_export_compact`** reads only the genes a run
+  needs (every gene, a list, or the genes of the export's own pairs),
+  restricted to the cells in use with 32-bit cell indices, reading the file
+  once.
+- **`scripts/write_in_use_h5mu.py`** writes a dataset that kept every cell
+  (the export's default) as the standard file holding only its cells in use,
+  which a backed read needs: every modality and `obs` subset to the cells in
+  use, the NT-cell pool renumbered among them, and the global `var` copied
+  as it is. Anything else that would keep the old numbering is refused, and
+  the input is never modified.
 
 ### Changed
 
 - **`run_specificity_check`** derives `log_2_fold_change` from `fold_change`
-  when a result has only the latter, as a discovery result does; counts a
-  screened trans row as a test that is not a call, and refuses one whose
-  screen could hide a call at the cutoff; warns when a cis gene has no
-  background test, whose background rate then counts as 0; reads the trans
-  result once; gives the same rows for categorical and object id columns; and
-  names the first pairs when a cis pair spans two chromosomes.
+  when a result has only the latter, as a discovery result does, with a fold
+  change at or below 0 (which the dose test can report) giving `-inf`; counts
+  a screened row, in either result, as a test that is not a call, and refuses
+  one whose screen could hide a call at the cutoff; warns when a cis gene has
+  no background test, whose background rate then counts as 0; reads the
+  trans result once; gives the same rows for categorical and object id
+  columns; and names the first pairs when a cis pair spans two chromosomes.
+- **`scripts/sceptre_io.load_h5mu`, and so `load_export` reading an
+  `.h5mu`, return the covariate matrix row-major whatever the file.** They
+  used to return it column-major for a file read without subsetting its cells
+  (one holding only its cells in use, or any file read with `all_cells=True`)
+  and row-major for a file subset to its cells in use, and BLAS rounds the
+  two layouts differently, so the same data gave analyses differing in the
+  last bits. Both kinds of `.h5mu` now give the same bits, and an analysis
+  whose covariates used to come back column-major differs in its last bits
+  from the same analysis under 0.5.0. The unconverted intermediate that
+  `load_export` falls back to is not changed.
 
 ## 0.5.0
 
