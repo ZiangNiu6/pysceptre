@@ -9,7 +9,10 @@ step runs in a batch job; every path comes from the command line.
   run_trans_background.py combine --pairs-dir DIR --shards SHARDS --out COMBINED
   run_trans_background.py specificity --cis-tsv CIS.tsv --pairs-dir DIR --trans COMBINED --out OUT
 
-`fit-genes` computes width-1 gene fits for one subset of the cis genes with
+With `--backed`, `fit-genes` and `shard` read each gene from the dataset as
+they reach it instead of holding the counts in memory; the dataset must hold
+only its cells in use (`write_in_use_h5mu.py`). `fit-genes` computes width-1
+gene fits for one subset of the cis genes with
 `pysceptre.pipeline.gene_cache.fit_gene_cache`, the engine's own call. `shard`
 tests one shard's pairs with `pysceptre.pipeline.trans.iter_trans_analysis`:
 the shard's reference (cis) pairs in full, compared bit for bit with the
@@ -40,7 +43,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).parent))
-from sceptre_io import load_export_compact  # noqa: E402
+from sceptre_io import load_export_compact, load_h5mu  # noqa: E402
 
 from pysceptre.analytical_power.inputs import bh_nominal_cutoff  # noqa: E402
 from pysceptre.pipeline.discovery import _CI_Z, _as_pct, chunk_layout_hash  # noqa: E402
@@ -112,6 +115,15 @@ def _reference_chunks(ex, layout, expected):
     return reference, chunks
 
 
+def _load(a: argparse.Namespace):
+    """The dataset: the reference run's genes held in memory, or with `--backed` every gene
+    read from the file as needed (a file holding only its cells in use; see
+    `write_in_use_h5mu.py`)."""
+    if getattr(a, "backed", False):
+        return load_h5mu(a.dataset, backed=True)
+    return load_export_compact(a.dataset, genes="pairs")
+
+
 def cmd_fit_genes(a: argparse.Namespace) -> None:
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -121,7 +133,7 @@ def cmd_fit_genes(a: argparse.Namespace) -> None:
         return
     t0 = time.time()
     # The reference run's genes only, in matrix order: the list build_trans_pairs.py writes.
-    ex = load_export_compact(a.dataset, genes="pairs")
+    ex = _load(a)
     genes = list(ex.gene_ids)
     mine = [str(g) for g in np.array_split(np.asarray(genes, dtype=object), a.n_tasks)[a.task]]
     print(
@@ -192,7 +204,7 @@ def cmd_shard(a: argparse.Namespace) -> None:
 
     t0 = time.time()
     # The trans genes are the reference run's genes; nothing else is read.
-    ex = load_export_compact(a.dataset, genes="pairs")
+    ex = _load(a)
     print(f"loaded in {time.time() - t0:.0f}s", flush=True)
     reference, _ = _reference_chunks(ex, layout, expected)
     meta = ex.metadata
@@ -575,6 +587,7 @@ def main() -> None:
     f.add_argument("--n-jobs", type=int, default=1)
     f.add_argument("--part-size", type=int, default=170, help="genes per saved part")
     f.add_argument("--glm-solver", choices=["outer", "structured"], default="outer")
+    f.add_argument("--backed", action="store_true", help="read counts from the dataset as needed")
     f.set_defaults(fn=cmd_fit_genes)
 
     s = sub.add_parser("shard")
@@ -604,6 +617,7 @@ def main() -> None:
         default="outer",
         help="the reference run's; --gene-fits must hold fits made with it",
     )
+    s.add_argument("--backed", action="store_true", help="read counts from the dataset as needed")
     s.set_defaults(fn=cmd_shard)
 
     c = sub.add_parser("combine")

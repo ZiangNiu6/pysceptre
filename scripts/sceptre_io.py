@@ -382,6 +382,59 @@ class CompactResponseMatrix:
 _MAX_BLOCK_ENTRIES = 2**31 - 1
 
 
+def _open_selected(path: str | Path, genes):
+    """The backed export, the in-use mask, its position map and the selected rows."""
+    path = Path(path)
+    h5 = path if path.is_file() else path / "dataset.h5mu"
+    export = load_h5mu(h5, backed=True, all_cells=True)
+    backed = export.response_matrix
+    n_all = backed.shape[1]
+    in_use = (
+        np.ones(n_all, dtype=bool)
+        if export.in_use is None
+        else np.asarray(export.in_use, dtype=bool)
+    )
+    if isinstance(genes, str) and genes == "pairs":
+        genes = set(export.pairs["response_id"])
+    if genes is None:
+        rows = list(range(backed.shape[0]))
+    else:
+        wanted = set(genes)
+        missing = sorted(wanted - set(export.gene_ids))
+        if missing:
+            raise KeyError(f"{len(missing)} gene(s) not in {h5}, e.g. {missing[:5]}")
+        rows = [i for i, g in enumerate(export.gene_ids) if g in wanted]
+    return export, in_use, rows
+
+
+def _selected_rows(backed, rows: list[int], in_use: np.ndarray, read_entries: int):
+    """Each selected row's cells in use, as `int32` positions among them, and its counts.
+
+    The file is read in contiguous runs of selected rows of about
+    `read_entries` stored entries, so memory is one run at a time.
+    """
+    new_pos = np.cumsum(in_use) - 1
+    indptr_all = backed._indptr
+    run_start = 0
+    while run_start < len(rows):
+        # A run of consecutive selected rows, cut at about `read_entries` stored entries.
+        run_end = run_start + 1
+        while (
+            run_end < len(rows)
+            and rows[run_end] == rows[run_end - 1] + 1
+            and indptr_all[rows[run_end] + 1] - indptr_all[rows[run_start]] <= read_entries
+        ):
+            run_end += 1
+        first, last = rows[run_start], rows[run_end - 1] + 1
+        chunk = backed.rows(first, last)
+        for r in range(last - first):
+            lo, hi = chunk.indptr[r], chunk.indptr[r + 1]
+            cells = chunk.indices[lo:hi]
+            keep = in_use[cells]
+            yield new_pos[cells[keep]].astype(np.int32), chunk.data[lo:hi][keep]
+        run_start = run_end
+
+
 def load_export_compact(
     path: str | Path, genes=None, *, read_entries: int = 1 << 27
 ) -> SceptreExport:
@@ -400,28 +453,9 @@ def load_export_compact(
     Raises:
         KeyError: a requested gene is not in the file.
     """
-    path = Path(path)
-    h5 = path if path.is_file() else path / "dataset.h5mu"
-    export = load_h5mu(h5, backed=True, all_cells=True)
+    export, in_use, rows = _open_selected(path, genes)
     backed = export.response_matrix
-    n_all = backed.shape[1]
-    in_use = (
-        np.ones(n_all, dtype=bool)
-        if export.in_use is None
-        else np.asarray(export.in_use, dtype=bool)
-    )
-    new_pos = np.cumsum(in_use) - 1
     n_keep = int(in_use.sum())
-    if isinstance(genes, str) and genes == "pairs":
-        genes = set(export.pairs["response_id"])
-    if genes is None:
-        rows = list(range(backed.shape[0]))
-    else:
-        wanted = set(genes)
-        missing = sorted(wanted - set(export.gene_ids))
-        if missing:
-            raise KeyError(f"{len(missing)} gene(s) not in {h5}, e.g. {missing[:5]}")
-        rows = [i for i, g in enumerate(export.gene_ids) if g in wanted]
 
     blocks: list[sparse.csr_matrix] = []
     data_parts: list[np.ndarray] = []
@@ -446,32 +480,13 @@ def load_export_compact(
         lengths.clear()
         held = 0
 
-    indptr_all = backed._indptr
-    run_start = 0
-    while run_start < len(rows):
-        # A run of consecutive selected rows, cut at about `read_entries` stored entries.
-        run_end = run_start + 1
-        while (
-            run_end < len(rows)
-            and rows[run_end] == rows[run_end - 1] + 1
-            and indptr_all[rows[run_end] + 1] - indptr_all[rows[run_start]] <= read_entries
-        ):
-            run_end += 1
-        first, last = rows[run_start], rows[run_end - 1] + 1
-        chunk = backed.rows(first, last)
-        for r in range(last - first):
-            lo, hi = chunk.indptr[r], chunk.indptr[r + 1]
-            cells = chunk.indices[lo:hi]
-            keep = in_use[cells]
-            idx = new_pos[cells[keep]].astype(np.int32)
-            val = chunk.data[lo:hi][keep]
-            if held + idx.size > _MAX_BLOCK_ENTRIES:
-                flush()
-            data_parts.append(val)
-            idx_parts.append(idx)
-            lengths.append(int(idx.size))
-            held += int(idx.size)
-        run_start = run_end
+    for idx, val in _selected_rows(backed, rows, in_use, read_entries):
+        if held + idx.size > _MAX_BLOCK_ENTRIES:
+            flush()
+        data_parts.append(val)
+        idx_parts.append(idx)
+        lengths.append(int(idx.size))
+        held += int(idx.size)
     flush()
     backed.close()
 
@@ -517,7 +532,7 @@ def subset_to_cells_in_use(export: SceptreExport, *, matrix_in_use: bool = False
         return {unit: remap_one(idxs) for unit, idxs in cells.items()}
 
     matrix = export.response_matrix
-    if hasattr(matrix, "rows") and not isinstance(matrix, CompactResponseMatrix):
+    if hasattr(matrix, "rows") and not matrix_in_use:
         raise ValueError(
             "this dataset was written with --all-cells and a backed read cannot subset it to "
             "cells_in_use: BackedResponseMatrix serves columns straight from the file. Load it "
@@ -611,7 +626,12 @@ def load_h5mu(path: str | Path, backed: bool = False, all_cells: bool = False) -
             X = sparse.csc_matrix(X)
         response_matrix = X.T.tocsr() if not sparse.isspmatrix_csr(X.T) else X.T
 
-    covariate_matrix = mdata.obs[list(metadata["covariate_names"])].to_numpy(dtype=float)
+    # Row-major whatever the file: a frame's `to_numpy` is column-major, while subsetting an
+    # `--all-cells` file to its cells in use returns row-major, and BLAS gives the two
+    # layouts different last bits. One layout keeps both files' analyses identical.
+    covariate_matrix = np.ascontiguousarray(
+        mdata.obs[list(metadata["covariate_names"])].to_numpy(dtype=float)
+    )
     in_use = (
         mdata.obs["in_use"].to_numpy(dtype=bool)
         if "in_use" in mdata.obs

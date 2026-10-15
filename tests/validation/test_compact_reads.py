@@ -132,3 +132,71 @@ def test_qc_counts_and_discovery_are_identical(dataset):
 def test_unknown_gene_is_refused(dataset):
     with pytest.raises(KeyError, match="not in"):
         load_export_compact(dataset, genes=["g1", "nope"])
+
+
+# --- a file holding only its cells in use ------------------------------------
+
+
+@pytest.fixture(
+    scope="module", params=[{}, {"compression": "gzip", "compression_opts": 1, "shuffle": True}]
+)
+def in_use_file(dataset, tmp_path_factory, request):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+    from write_in_use_h5mu import write_in_use
+
+    return write_in_use(
+        dataset, tmp_path_factory.mktemp("in_use") / "dataset.h5mu", **request.param
+    )
+
+
+def test_the_in_use_file_reads_as_the_compact_loader(dataset, in_use_file):
+    compact = load_export_compact(dataset)
+    backed = sceptre_io.load_h5mu(in_use_file, backed=True)
+    assert backed.gene_ids == compact.gene_ids
+    assert backed.response_matrix.shape == compact.response_matrix.shape
+    for j in range(len(backed.gene_ids)):
+        a = _get_row(compact.response_matrix, j)
+        b = _get_row(backed.response_matrix, j)
+        assert a.dtype == b.dtype and np.array_equal(a, b), j
+    assert np.array_equal(backed.covariate_matrix, compact.covariate_matrix)
+    # One layout for both files: BLAS gives row- and column-major different last bits.
+    assert backed.covariate_matrix.flags.c_contiguous
+    assert compact.covariate_matrix.flags.c_contiguous
+    assert load_export(dataset).covariate_matrix.flags.c_contiguous
+    assert list(backed.grna_target_cells) == list(compact.grna_target_cells)
+    for t, cells in compact.grna_target_cells.items():
+        assert np.array_equal(backed.grna_target_cells[t], cells)
+    assert backed.pairs.equals(compact.pairs)
+    assert backed.metadata["n_cells"] == compact.covariate_matrix.shape[0]
+    assert backed.metadata["all_cells"] is False or backed.metadata["all_cells"] == 0
+
+
+@pytest.mark.parametrize("n_jobs", [1, 2])
+def test_the_in_use_file_gives_the_same_discovery(dataset, in_use_file, n_jobs):
+    eager = load_export(dataset)
+    backed = sceptre_io.load_h5mu(in_use_file, backed=True)
+    runs = [
+        run_discovery_analysis(
+            ex.response_matrix,
+            ex.gene_ids,
+            ex.covariate_matrix,
+            ex.grna_target_cells,
+            eager.pairs,
+            seed=5,
+            n_jobs=n_jobs,
+        )
+        for ex in (eager, backed)
+    ]
+    pd.testing.assert_frame_equal(runs[0], runs[1], check_exact=True)
+
+
+def test_the_all_cells_file_is_refused_backed(dataset, in_use_file):
+    with pytest.raises(ValueError, match="all-cells"):
+        sceptre_io.load_h5mu(dataset, backed=True)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+    from write_in_use_h5mu import write_in_use
+
+    with pytest.raises(FileExistsError):
+        write_in_use(dataset, in_use_file)
+    with pytest.raises(ValueError, match="only cells in use"):
+        write_in_use(in_use_file, in_use_file.with_name("again.h5mu"))
