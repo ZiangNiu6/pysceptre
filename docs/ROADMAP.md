@@ -170,6 +170,7 @@ Ranked by measured win over effort.
 | ~~T2.5 Sparse-matmul null statistic~~ | **42.7 -> 11.2 ms** on the hot call, **1.72x end to end** | measured |
 | T2.3 Parallelize `fit_all_targets` | **measured, and mostly blocked** -- see below | measured |
 | ~~T2.4 Sparse-aware `fit_all_genes`~~ | **already resolved**; the premise was stale | done |
+| T2.7 The trans background on 8 x 16 cores | **estimated** 2.5M -> 0.2M core-s, about 30 min on 128 cores | estimate |
 
 **T2.1/T2.2/T2.5 are done.** The per-pair statistic no longer gathers
 `D[:, flat_idxs]` at all: the draws are a `(B, n_cells)` 0/1 CSR matrix and
@@ -268,6 +269,142 @@ scale against sceptre's 33,066:
 | pysceptre, per gene per chunk | 3,660 | ~0.1 min |
 
 Output is bit-for-bit identical, row order included.
+
+### T2.7 The trans background in about half an hour on 128 cores -- PLANNED
+
+**Why.** `run_specificity_check` needs a background of the order of 1e8
+element x gene pairs on a transcriptome-wide screen. On a 1.55M-cell screen
+with 69 covariates (10.5k elements x 10.8k genes, 1.0e8 QC-passing trans
+pairs), `run_trans_analysis` with its two screens is estimated at 2.3M to 2.7M
+core-s: about 1,000 cores for an hour. The aim is 128 cores for about half an
+hour, as **8 jobs of 16 cores**, each well under 128 GB, because jobs of that
+shape schedule far more easily than whole nodes.
+
+**Already in place.** The trans engine, its screens and the gene-fit cache
+(docs/design.md, "The trans background"); `glm_solver="structured"`, which
+makes gene and target fits cheap enough to be a one-time cost of minutes
+rather than node-hours, and makes a target's fit independent of its chunk
+(docs/design.md, "Indicator columns in the IRLS"); a compact loader for the
+genes a run needs (`scripts/sceptre_io.py`, `load_export_compact`). On that
+screen the structured cis re-run gave the same calls as the outer-product
+route at BH 0.1 (none gained or lost), the same stage for every pair, and
+the same p-value bit for bit for every pair decided in the first or third
+stage.
+
+**Design: certified comparisons.** Nothing statistical changes; the cost moves.
+
+1. *Stage 1.* A resample's statistic is compared with the observed one
+   through a cheap route, about 8 numbers per cell (`a`, `w`, the dense
+   covariates and the indicator codes) and a per-gene `p x p` matrix `M`,
+   instead of `draws @ stacked` over `p + 2` columns. A rigorous bound on the
+   rounding error of both routes, from the standard bounds on sums and inner
+   products (valid in any summation order, with or without FMA), decides the
+   comparison whenever the two statistics are further apart than the bound;
+   anything closer goes through the current route. Counts, early stops,
+   floors, escalations and the stage-1 and stage-3 p-values are then the
+   current route's own, bit for bit. Undecided comparisons are expected to be
+   rare enough to cost nothing measurable (estimate from simulation).
+2. *`M` per gene*, from the same `Z^T W Z` and eigendecomposition as
+   `compute_precomputation_pieces`, under one BLAS thread, computed once. The
+   bound holds only if it is that route's `M`.
+3. *Draws* from a sampler split at birth: bitwise `crt_index_sampler_fast`'s
+   rows, first stage stored by row (`int32` cells), second stage by cell
+   (`uint16` counts and row ids), so stage 2 is one sequential sweep per gene.
+4. *Stage 2.* The skew-normal fit's decisions (fit accepted, `p <= cutoff`,
+   `p < 0.05`, the stage) are certified by an interval enclosure of the fit,
+   with the current route as the fallback for anything undecided. This rests
+   on one stated assumption: scipy's `skewnorm` tail is within 1e-8 relative
+   of the exact value at the cutoff, which needs widening for cutoffs at or
+   below about 2e-6. The second-stage p-values themselves are not bitwise
+   (typically within about 5e-8 relative), and neither is `z_orig` (about
+   1e-11); every decision the specificity check reads is.
+5. *Layout.* Targets are split 8 ways by total treated cells. Each job fits
+   and draws its own eighth of the targets (structured fits, a minute or
+   two), then sweeps every gene once, rebuilding `mu`, `w` and `a` per gene.
+
+**Budget per job (estimates).**
+
+| | resident counts | streamed counts |
+|---|---|---|
+| draws for an eighth of the targets | 17 to 19 GB | 17 to 19 GB |
+| counts of every tested gene | 27 GB | about 1 GB window |
+| covariates, `M`, indicator codes | about 2 GB | about 2 GB |
+| 16 workers' gene records | 2 to 3 GB | 2 to 3 GB |
+| **total** | **about 50 GB** | **about 25 GB** |
+
+The draws are counted from the listings they hold (499 and 4,999 resamples
+over 9.9M treated cells in all); the counts are 4.47e9 stored nonzeros at 6
+bytes each, read from the screen's own file. Time: about 1.7e5 to 2.8e5 core-s
+in all, 22 to 37 minutes of compute on 128 cores, from prototype kernels timed at the
+screen's dimensions on simulated data with 16 workers per node (12 us per
+first-stage resample alone, 18 us under that load), and from simulated rates
+for the fraction of pairs with a fold change below 1 (about half), the
+first-stage rows a pair needs before it stops (about 109) and the escalation
+rate (about 2%). An 8-way split rebuilds every gene 8 times rather than 4,
+about 1.5 extra minutes in all. The split suits the hardware as well as the
+queue: on a 32-core node the per-resample slowdown under load was about the
+same with 32 workers as with 16 (1.57 against 1.51), but a stage-2 pair took
+74 ms with 32 workers against 48 ms with 16.
+
+**Streaming the counts.** Every job needs every gene, so the counts are the
+part of memory the target split cannot divide. The `.h5mu` keeps them in
+HDF5 chunks with 64-bit cell indices, which cannot be mapped at fixed
+offsets: export them
+once to a gene-major raw file (offsets, `int32` cells, `uint16` counts) and
+read each gene as the sweep reaches it, either through `np.memmap` behind the
+response-matrix interface the engine already reads (`shape`, `dtype`, `nnz`,
+`rows`, `__getitem__`) or with explicit read-ahead. To measure: rows equal to
+the compact loader's bit for bit; resident memory; read throughput from
+shared storage with one job and with eight at once; whether the sweep ever
+waits on a read.
+
+**Gates, in order.**
+
+1. Real-data rates from pilot shards on today's engine: the fraction of
+   pairs with a fold change below 1, first-stage rows per pair, the
+   escalation rate, the skew-normal rejection rate. Each 10% change in rows
+   or escalations moves the total by about a minute.
+2. The streaming test above, on today's engine.
+3. Exactness on real data, on the reference CPU class with one BLAS thread:
+   about 20 genes against about 4 chunks of targets, every resample of every
+   pair through both routes. Every difference within its bound; counts,
+   stops, floors, escalations, stage-3 p-values and skew-normal decisions
+   equal. Include genes whose dispersion is clamped and the alphabetical
+   ordering of the batch dummies.
+4. A one-job rehearsal on real data: an eighth of the targets against a few
+   hundred genes, for seconds per gene under load and peak memory.
+5. Production with a built-in audit: a sample of pairs through the current
+   route, compared decision for decision.
+
+**Implementation, in order.** Each step lands with tests on synthetic data
+that hold it bitwise (or decision for decision, for stage 2) to the current
+route.
+
+1. The stage-1 kernel and its bound (numba), taking each cell's indicator
+   codes from the covariate matrix itself rather than assuming a column
+   order, with the bound's correction term computed without cancellation,
+   and asserting its preconditions once per run (non-negative covariates and
+   counts, exact one-hot dummies, `a >= -w`, no dose weights).
+2. The `M` pass, with a check that it reproduces the route's `D`.
+3. The split sampler.
+4. The stage-2 kernel and the certified skew-normal decisions, with
+   knife-edge cases that must fall back.
+5. A route in `pipeline/trans.py` that uses them, refusing what it cannot
+   certify; a screened row keeps its meaning.
+6. The runner: 8 target blocks, streamed counts, restartable parts, the
+   audit.
+7. docs/design.md: the bound, what is and is not bitwise, and the measured
+   figures from the gates.
+
+**Risks.** Memory bandwidth on a node shared with other jobs (only 16 workers
+on a half node were measured); a mis-specified per-cell sum would pass the
+bound, since the bound covers rounding only (the defence is taking the
+columns from the covariate matrix, a per-gene self-test and the audit); the
+bits of `M` and `mu` depend on the CPU class, the BLAS thread count and the
+covariate matrix's layout, so production runs where the reference ran.
+
+Related: T2.6 on the many-covariates branch (the per-chunk rebuild at large
+`p`), which the structured solver and this design both address.
 
 ### Note on the performance figures
 
