@@ -216,6 +216,10 @@ def test_screened_rows_are_tested_and_carried():
     assert list(plain.columns) == ["grna_target", "response_id", "p_value", "log_2_fold_change"]
     keep = trans["pass_qc"] & trans["p_value"].notna()
     want_plain = _with_lfc(trans).loc[keep, list(plain.columns)].reset_index(drop=True)
+    # tested_pairs returns its ids as object, whatever string dtype pandas gave the input.
+    want_plain[["grna_target", "response_id"]] = want_plain[["grna_target", "response_id"]].astype(
+        object
+    )
     pd.testing.assert_frame_equal(plain, want_plain, check_exact=True)
     # A row with no p-value and no screen was not tested.
     assert (
@@ -286,10 +290,17 @@ def test_categorical_ids_give_exactly_the_object_result():
     cat = _check(_as_categorical(cis, 1), _as_categorical(scr, 2), elements, genes)
     _assert_same_tables(obj, cat)
     pd.testing.assert_frame_equal(obj.background, cat.background, check_exact=True)
-    for frame in (cat.links, cat.background, cat.broad_effect, cat.per_gene):
+    # No categorical leaks into a table; the id dtype is otherwise the same as from object input
+    # (object, or pandas 3's string dtype for tables built from lists).
+    for got_t, want_t in zip(
+        (cat.links, cat.background, cat.broad_effect, cat.per_gene),
+        (obj.links, obj.background, obj.broad_effect, obj.per_gene),
+        strict=True,
+    ):
         for c in ("grna_target", "response_id"):
-            if c in frame:
-                assert frame[c].dtype == object
+            if c in got_t:
+                assert not isinstance(got_t[c].dtype, pd.CategoricalDtype)
+                assert got_t[c].dtype == want_t[c].dtype
     got = background.tested_pairs(_as_categorical(scr, 3), "trans_result")
     pd.testing.assert_frame_equal(
         got, background.tested_pairs(scr, "trans_result"), check_exact=True
