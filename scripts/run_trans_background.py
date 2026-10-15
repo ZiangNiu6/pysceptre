@@ -139,6 +139,13 @@ def cmd_fit_genes(a: argparse.Namespace) -> None:
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     whole = out / f"gene_fits_{a.task:03d}of{a.n_tasks:03d}.npz"
+    # A file from before the fingerprint recorded the covariate layout is refused by every
+    # load; stop rather than skip it as done.
+    for old in sorted(out.glob(f"gene_fits_{a.task:03d}of{a.n_tasks:03d}*.npz")):
+        try:
+            load_gene_cache(old, check_environment=False)
+        except ValueError as e:
+            raise SystemExit(f"{old} cannot be reused ({e}); delete it and rerun fit-genes") from e
     if whole.exists():
         print(f"exists: {whole}")
         return
@@ -344,7 +351,8 @@ def cmd_shard(a: argparse.Namespace) -> None:
         chunk_memory_gb=layout["chunk_memory_gb"],
         expected_fit_chunks=expected,
         fit_chunk_ids=chunk_ids,
-        gene_fits=cache,
+        # Checked against the data above, once; a plain dict is not checked again.
+        gene_fits=cache.fits,
         p_exact_below=a.p_exact_below,
         block_rows=a.block_rows,
         n_jobs=a.n_jobs,

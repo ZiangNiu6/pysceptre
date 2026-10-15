@@ -422,7 +422,9 @@ def iter_trans_analysis(
     it, and the process-wide limit of one BLAS thread. Generators interleaved
     in one thread keep their own inputs and may finish in any order; the
     BLAS limit goes back to what it was before the first of them started
-    only when the last one finishes.
+    only when the last one finishes. The engine lock belongs to the thread
+    that started the generator: advance it, and exhaust or close it, in that
+    thread.
 
     Args:
         response_matrix, gene_ids, covariate_matrix, grna_target_cells: as for
@@ -466,7 +468,9 @@ def iter_trans_analysis(
     Yields:
         One `TransGeneResult` per gene of `pairs`, in `gene_ids` order. A pair
         tested in full matches `run_discovery_analysis` on the same inputs, bit
-        for bit on the same CPU and BLAS. A screened pair has `p_value` NaN and
+        for bit on the same CPU class and BLAS, with numba, and with the
+        covariate matrix in the same memory layout. A screened pair has
+        `p_value` NaN and
         `screen` "fold_change" (its fold change is at least 1) or "early_stop"
         (its p-value is at least `p_value_floor`).
 

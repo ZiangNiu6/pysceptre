@@ -73,8 +73,9 @@ sceptre; see [Design decisions](design.md#the-trans-background).
 ::: pysceptre.pipeline.api.run_trans_analysis
 
 Gene fits made once and reused by every shard of a trans run, passed as
-`gene_fits`. A cache records what its fits depend on, the covariate matrix's
-memory layout included, and is refused where that differs.
+`gene_fits`. A cache records what its fits and the pieces built from them
+depend on, the covariate matrix's memory layout included, and is refused where
+that differs.
 
 ::: pysceptre.pipeline.gene_cache.fit_gene_cache
     options:

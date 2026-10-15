@@ -29,7 +29,7 @@ __all__ = [
 DEFAULT_DISTANCE_BINS: tuple[float, ...] = (0.0, 1e3, 1e4, 5e4, 1e5, np.inf)
 _RESULT_COLUMNS = ("grna_target", "response_id", "p_value", "log_2_fold_change")
 _ID_COLUMNS = ("grna_target", "response_id")
-# A screened trans result's own columns, carried through when present.
+# A screened result's own columns, carried through when present.
 _SCREEN_COLUMNS = ("screen", "p_value_floor")
 # `screen` values of a pair that was tested but not resampled: no p-value.
 _SCREENED = ("fold_change", "early_stop")
@@ -275,7 +275,10 @@ def _cis_links(
 
     e_chrom = elements["chrom"].reindex(pairs["grna_target"]).to_numpy()
     g_chrom = genes["chrom"].reindex(pairs["response_id"]).to_numpy()
-    apart = e_chrom != g_chrom
+    # A missing chromosome counts as apart, whatever the column's dtype (pd.NA cannot be compared).
+    apart = pd.isna(e_chrom) | pd.isna(g_chrom)
+    both = ~apart
+    apart[both] = e_chrom[both] != g_chrom[both]
     if apart.any():
         first = np.flatnonzero(apart)[:10]
         listed = list(

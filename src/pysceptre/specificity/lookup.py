@@ -76,7 +76,7 @@ def gene_lookup(
 
     Every tested pair of a TSS target, from either result, against any gene
     other than its own. Several TSS targets of one gene are pooled. A
-    screened row of a screened trans result counts as tested, not lowering.
+    screened row of either result counts as tested, not lowering.
 
     Returns:
         `knocked_down`, `gene`, `tested`, `lowers` (called at `cutoff` with a

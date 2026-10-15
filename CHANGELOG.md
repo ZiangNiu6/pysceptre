@@ -35,7 +35,8 @@ Notable changes per release. Dates are the release date.
   and `load_gene_cache` make width-1 gene fits once and reuse them across the
   shards of a trans run, in an `.npz` that loads without pickle. The
   fingerprint records the data (the cell count, the covariate matrix's digest
-  and memory layout, each gene's count digest), the engine settings,
+  and memory layout, row- or column-major, a strided view being refused, each
+  gene's count digest), the engine settings,
   `glm_solver` among them, and the numeric environment, and `load_gene_cache`
   refuses fits that do not match the data it is given or this process's
   numeric environment (the latter unless `check_environment=False`).

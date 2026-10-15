@@ -536,9 +536,8 @@ def subset_to_cells_in_use(export: SceptreExport, *, matrix_in_use: bool = False
         raise ValueError(
             "this dataset was written with --all-cells and a backed read cannot subset it to "
             "cells_in_use: BackedResponseMatrix serves columns straight from the file. Load it "
-            "unbacked, or pass all_cells=True to read every cell. A dataset meant for backed "
-            "analysis should be exported without --all-cells, which is what that flag's cost is: "
-            "it is for the simulation path, which reads the matrix once and whole."
+            "unbacked, or pass all_cells=True to read every cell. For a backed analysis, write "
+            "the file holding only its cells in use with scripts/write_in_use_h5mu.py."
         )
 
     metadata = dict(export.metadata)

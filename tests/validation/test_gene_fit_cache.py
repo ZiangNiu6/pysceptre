@@ -315,26 +315,31 @@ def test_the_covariate_layout_is_recorded_beside_the_values(screen):
     wide = np.column_stack([cov, cov])
     assert gene_cache._covariate_layout(cov) == "C"
     assert gene_cache._covariate_layout(np.asfortranarray(cov)) == "F"
-    assert gene_cache._covariate_layout(wide[:, : cov.shape[1]]) == "strided"
+    with pytest.raises(ValueError, match="strided view"):
+        gene_cache._covariate_layout(wide[:, : cov.shape[1]])
     # One row or one column is both; it is "C".
     assert gene_cache._covariate_layout(np.asfortranarray(cov[:, :1])) == "C"
     c = fit_gene_cache(resp, genes, cov, genes=["g0"])
     f = fit_gene_cache(resp, genes, np.asfortranarray(cov), genes=["g0"])
-    strided = fit_gene_cache(resp, genes, wide[:, : cov.shape[1]], genes=["g0"])
+    with pytest.raises(ValueError, match="strided view"):
+        fit_gene_cache(resp, genes, wide[:, : cov.shape[1]], genes=["g0"])
     assert c.fingerprint["covariate_sha256"] == f.fingerprint["covariate_sha256"]
-    assert c.fingerprint["covariate_sha256"] == strided.fingerprint["covariate_sha256"]
-    assert [x.fingerprint["covariate_layout"] for x in (c, f, strided)] == ["C", "F", "strided"]
+    assert [x.fingerprint["covariate_layout"] for x in (c, f)] == ["C", "F"]
 
 
 def test_load_refuses_another_covariate_layout(screen, saved, tmp_path):
     resp, genes, cov, _, _ = screen
-    for other, layout in [
-        (np.asfortranarray(cov), "'F'"),
-        (np.column_stack([cov, cov])[:, : cov.shape[1]], "'strided'"),
-    ]:
-        assert np.array_equal(other, cov)
-        with pytest.raises(ValueError, match=f"memory layout {layout}; .* a 'C' one"):
-            load_gene_cache(saved, response_matrix=resp, gene_ids=genes, covariate_matrix=other)
+    other = np.asfortranarray(cov)
+    assert np.array_equal(other, cov)
+    with pytest.raises(ValueError, match="memory layout 'F'; .* a 'C' one"):
+        load_gene_cache(saved, response_matrix=resp, gene_ids=genes, covariate_matrix=other)
+    with pytest.raises(ValueError, match="strided view"):
+        load_gene_cache(
+            saved,
+            response_matrix=resp,
+            gene_ids=genes,
+            covariate_matrix=np.column_stack([cov, cov])[:, : cov.shape[1]],
+        )
     # Fits made from a column-major matrix load only with a column-major one.
     f_path = tmp_path / "fortran.npz"
     save_gene_cache(fit_gene_cache(resp, genes, np.asfortranarray(cov), genes=["g1"]), f_path)
@@ -549,7 +554,7 @@ def test_the_solver_is_recorded_and_checked(screen, saved, tmp_path):
         load_gene_cache([saved, structured])
 
 
-def test_a_cache_from_before_the_solver_loads_as_outer(saved, tmp_path):
+def test_a_cache_without_its_solver_is_refused(saved, tmp_path):
     with np.load(saved, allow_pickle=False) as z:
         arrays = {k: z[k] for k in z.files}
     fp = json.loads(str(arrays["fingerprint"][()]))
@@ -558,9 +563,8 @@ def test_a_cache_from_before_the_solver_loads_as_outer(saved, tmp_path):
     old = tmp_path / "old.npz"
     with open(old, "wb") as f:
         np.savez(f, **arrays)
-    assert load_gene_cache(old, glm_solver="outer").fingerprint["glm_solver"] == "outer"
-    with pytest.raises(ValueError, match="not 'structured'"):
-        load_gene_cache(old, glm_solver="structured")
+    with pytest.raises(ValueError, match="lacks.*glm_solver"):
+        load_gene_cache(old)
 
 
 def test_a_fingerprint_that_is_not_an_object_is_refused(saved, tmp_path):

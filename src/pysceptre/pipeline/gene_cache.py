@@ -66,8 +66,9 @@ class GeneFitCache:
     `fits` maps a gene id to its `GenePrecomputation`, as `fit_all_genes`
     returns it. `fingerprint` holds `format`; `n_cells`, `n_covariates` and
     `dfr` of the fit; `covariate_sha256`, of the covariate matrix as float64
-    C-order bytes; `covariate_layout`, that matrix's memory layout ("C", "F"
-    or "strided"), which the fits depend on in their last bits;
+    C-order bytes; `covariate_layout`, that matrix's memory layout ("C" or
+    "F"), which the outer route's fits and every route's per-pair pieces
+    depend on in their last bits;
     `theta_bounds`, `batch_width` and `glm_solver`, the engine settings the
     fits were made with; `count_digests`, per gene the `nnz`, `sum` and `sha1`
     of its nonzero counts; and `environment`, an `environment_fingerprint()`.
@@ -84,15 +85,24 @@ def _covariate_sha256(covariate_matrix: np.ndarray) -> str:
 
 
 def _covariate_layout(covariate_matrix: np.ndarray) -> str:
-    """The memory layout: "C" (row-major), "F" (column-major) or "strided" (neither).
+    """The memory layout: "C" (row-major) or "F" (column-major).
 
     A matrix that is both, with one row or one column, is "C".
+
+    Raises:
+        ValueError: the matrix is neither, a strided view: which layout BLAS
+            treats it as depends on the strides, so it is refused rather than
+            recorded.
     """
     if covariate_matrix.flags.c_contiguous:
         return "C"
     if covariate_matrix.flags.f_contiguous:
         return "F"
-    return "strided"
+    raise ValueError(
+        "covariate_matrix is neither row- nor column-major (a strided view); pass "
+        "np.ascontiguousarray(covariate_matrix) or np.asfortranarray(covariate_matrix), "
+        "the one the fits were or will be made with"
+    )
 
 
 def _row_nonzeros(response_matrix, row: int) -> tuple[np.ndarray, np.ndarray]:
@@ -401,8 +411,8 @@ def _check_data(
         if layout != fingerprint["covariate_layout"]:
             raise ValueError(
                 f"covariate_matrix has memory layout {layout!r}; the gene fits were made with "
-                f"a {fingerprint['covariate_layout']!r} one, and a fit depends on the layout "
-                "in its last bits. Pass the matrix in the layout the fits were made with, or "
+                f"a {fingerprint['covariate_layout']!r} one, and the outer route's fits and "
+                "every route's per-pair pieces depend on the layout in their last bits. Pass the matrix in the layout the fits were made with, or "
                 "refit them"
             )
     if response_matrix is not None:

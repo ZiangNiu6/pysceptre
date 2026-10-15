@@ -820,7 +820,9 @@ code gives different last bits on different machines
 ([Design decisions](https://broadinstitute.github.io/pysceptre/design/#bits-depend-on-the-machine)).
 
 **The exception is a gene close to Poisson.** In the two rows marked "except
-as below" the gene fits themselves differ in their last bits, and for a gene
+as below" the gene fits can themselves differ in their last bits (always on
+another CPU type; for another covariate layout, under the default
+`glm_solver="outer"`, since `"structured"` fits from a row-major copy), and for a gene
 with little or no overdispersion which branch the dispersion estimate ends on
 can turn on those bits. Such a gene's `theta`, and with it its p-values, can
 then differ by much more than rounding

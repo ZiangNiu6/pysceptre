@@ -1420,7 +1420,8 @@ matrix in the layout it is given, so the two layouts can give one analysis
 different last bits. The engine does not pin the layout: `run_trans_analysis`
 given no gene fits, or a plain dict of them, accepts either. What pins it is
 around the engine. A gene-fit cache records the layout its fits were made
-with and is refused with another, and `scripts/sceptre_io.load_h5mu` returns
+with and is refused with another (a strided view is refused outright: which
+layout BLAS treats it as depends on its strides), and `scripts/sceptre_io.load_h5mu` returns
 the covariate matrix row-major whatever the file, so the two ways of writing
 a dataset give the same bits; a caller with its own matrix must pass the
 reference run's layout. Without numba, the CRT sampler lists each resample's
